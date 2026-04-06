@@ -2,4 +2,31 @@ __pycache__/
 *.pyc
 *.egg-info/
 build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# Local data / artifacts
+*.pt
+
+# Notebook outputs
+.ipynb_checkpoints/
+*.ipynb
+
+# Generated images
+*.png
+
+# Monitor
+monitor/
+
+# Example assets
+examples/images/
+
+# Local model weights
+clip_model/
+
+# Misc test files
 test.py
+imagenette/
