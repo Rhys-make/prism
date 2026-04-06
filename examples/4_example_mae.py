@@ -13,7 +13,7 @@
 # This is an example of how to patch MAE with ToMe (make sure to set r somewhere too).
 # Place these functions in https://github.com/facebookresearch/mae/blob/main/models_vit.py
 
-import tome
+import edge.tome as tome
 
 
 def vit_base_patch16(**kwargs):

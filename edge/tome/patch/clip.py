@@ -4,9 +4,9 @@ from typing import Tuple, Optional
 from transformers.models.clip.modeling_clip import CLIPEncoderLayer, CLIPAttention
 
 # 导入 ToMe 核心算法：二分图软匹配、来源追踪、加权平均合并
-from tome.merge import bipartite_soft_matching, merge_source, merge_wavg
+from edge.tome.merge import bipartite_soft_matching, merge_source, merge_wavg
 # 导入 ToMe 工具：解析 r（裁减数量）的分布
-from tome.utils import parse_r
+from edge.tome.utils import parse_r
 
 # =====================================================================
 # 1. 魔改 Hugging Face 的 CLIPAttention (纯原生 PyTorch，不依赖私有函数)

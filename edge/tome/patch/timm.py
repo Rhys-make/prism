@@ -15,9 +15,9 @@ import torch # 导入深度学习老大哥 PyTorch，所有矩阵运算都靠它
 from timm.models.vision_transformer import Attention, Block, VisionTransformer 
 # 从 `timm`（一个超全的开源视觉模型库）里，把原版 ViT 的三大核心零件拆下来：注意力层 (Attention)、网络基础块 (Block)、以及整辆车 (VisionTransformer)。
 
-from tome.merge import bipartite_soft_matching, merge_source, merge_wavg 
+from edge.tome.merge import bipartite_soft_matching, merge_source, merge_wavg 
 # 导入我们之前已经拆解过的、你自己写的 ToMe 三大神器：匹配找对象的、记族谱账本的、加权融合特征的。
-from tome.utils import parse_r 
+from edge.tome.utils import parse_r 
 # 导入用来解析“每一层到底要裁员多少个 Token”的计划表工具。
 
 
