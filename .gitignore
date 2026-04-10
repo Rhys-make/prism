@@ -10,6 +10,8 @@ env/
 
 # Local data / artifacts
 *.pt
+data/
+tllm/
 
 # Notebook outputs
 .ipynb_checkpoints/

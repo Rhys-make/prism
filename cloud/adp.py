@@ -1,55 +1,60 @@
 import torch
 import torch.nn as nn
 
-class AsymmetricDemergingProjector(nn.Module):
-    def __init__(self, in_dim=1024, llm_dim=4096, expand_ratio=4):
+class SemanticResampler(nn.Module):
+    def __init__(self, in_dim=1024, llm_dim=2048, num_queries=128, num_heads=8):
         """
-        初始化非对称重构投影器
-        in_dim: 边缘端 ViT 的输出维度 (如 CLIP ViT-Large 为 1024)
-        llm_dim: 云端 LLM 的输入维度 (如 LLaMA-7B 为 4096)
-        expand_ratio: 序列膨胀倍数 (如 25 个 Token 变 100 个，设为 4)
+        Prism-VLM 核心云端解码器
+        :param in_dim: 边缘端传来的特征维度 (比如 1024)
+        :param llm_dim: 云端 TinyLlama 的隐层维度 (2048)
+        :param num_queries: 固定输出的 Token 数量 (M=128)
         """
         super().__init__()
-        self.expand_ratio = expand_ratio
-        self.in_dim = in_dim
+        self.num_queries = num_queries
         self.llm_dim = llm_dim
         
-        # 1. 联合升维与特征膨胀层
-        # 将原始维度直接投射到 (LLM维度 * 膨胀倍数) 的超大空间
-        # 相当于给每个未来的新 Token 都预留了特征槽位
-        self.up_proj = nn.Linear(in_dim, llm_dim * expand_ratio)
+        # 1. 云端侦探：可学习的 Query 向量 [1, 128, 2048]
+        self.queries = nn.Parameter(torch.randn(1, num_queries, llm_dim))
         
-        # 2. 激活函数
-        # 提供非线性能力，这是让网络学会“语义解纠缠”的关键
-        self.act = nn.GELU()
+        # 2. 维度投影：先把边缘端 1024 维拉升到 2048 维，方便做 Attention
+        self.kv_proj = nn.Linear(in_dim, llm_dim)
         
-        # 3. 特征平滑层
-        # 让拆解后的特征在各自的槽位里进行混合与微调，更好地贴合 LLM 的输入分布
-        self.smooth = nn.Linear(llm_dim * expand_ratio, llm_dim * expand_ratio)
+        # 3. 交叉注意力机制 (核心)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=llm_dim, 
+            num_heads=num_heads, 
+            batch_first=True
+        )
+        
+        # 4. FFN (前馈网络) 用于增强语义表达
+        self.ln_1 = nn.LayerNorm(llm_dim)
+        self.ln_2 = nn.LayerNorm(llm_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(llm_dim, llm_dim * 4),
+            nn.GELU(),
+            nn.Linear(llm_dim * 4, llm_dim)
+        )
 
-    def forward(self, x):
+    def forward(self, edge_features):
         """
-        前向传播
-        输入 x 形状: [B, N, in_dim]  (例如: [1, 25, 1024])
-        输出形状: [B, N * expand_ratio, llm_dim] (例如: [1, 100, 4096])
+        :param edge_features: 形状 [Batch, N, 1024] (N是波动的)
+        :return: 形状 [Batch, 128, 2048] (绝对固定)
         """
-        B, N, _ = x.shape
+        B = edge_features.shape[0]
         
-        # Step 1 & 2 & 3: 特征空间的映射与非线性处理
-        # 形状变化: [B, 25, 1024] -> [B, 25, 16384] (注: 4096 * 4)
-        x = self.up_proj(x)
-        x = self.act(x)
-        x = self.smooth(x)
+        # 对齐维度作为 Key 和 Value
+        kv = self.kv_proj(edge_features)  # [B, N, 2048]
         
-        # --- 核心空间折叠魔法 (Reshape) ---
+        # 扩展 Query 以匹配 Batch Size
+        q = self.queries.expand(B, -1, -1)  # [B, 128, 2048]
         
-        # Step 4: 将巨大的隐藏层维度拆开，分离出“倍数”维度
-        # 形状变化: [B, 25, 16384] -> [B, 25, 4, 4096]
-        x = x.view(B, N, self.expand_ratio, self.llm_dim)
+        # 执行 Cross-Attention
+        # attn_out: [B, 128, 2048]
+        attn_out, _ = self.cross_attn(query=q, key=kv, value=kv)
         
-        # Step 5: 融合前两个维度，将原本并行的特征转化为序列长度
-        # 形状变化: [B, 25, 4, 4096] -> [B, 100, 4096]
-        x = x.contiguous().view(B, N * self.expand_ratio, self.llm_dim)
+        # 残差连接 + LayerNorm
+        out = self.ln_1(q + attn_out)
+        out = out + self.ffn(self.ln_2(out))
         
-        return x
+        return out
 
