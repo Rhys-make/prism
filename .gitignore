@@ -20,8 +20,7 @@ tllm/
 # Generated images
 *.png
 
-# Monitor
-monitor/
+
 
 # Example assets
 examples/images/
