@@ -14,7 +14,7 @@ from cloud.adp import SemanticResampler
 
 # ---------------------------------------------------------
 # 1. 数据集定义 (COCO Captions - CPU 兼容版)
-# ---------------------------------------------------------
+# -----------------------------------------------------------
 class COCODataset(Dataset):
     def __init__(self, img_dir, ann_file, tokenizer, transform=None, max_length=64):
         self.img_dir = img_dir
