@@ -24,6 +24,10 @@ tllm/
 
 # Example assets
 examples/images/
+images/
+examples/Imagenette/
+Imagenette/
+data/
 
 # Local model weights
 clip_model/
@@ -31,3 +35,6 @@ clip_model/
 # Misc test files
 test.py
 imagenette/
+
+checkpoints/
+models/

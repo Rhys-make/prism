@@ -2,21 +2,14 @@ import torch
 import torch.nn as nn
 
 class SemanticResampler(nn.Module):
-    def __init__(self, in_dim=1024, llm_dim=2048, num_queries=128, num_heads=8):
-        """
-        Prism-VLM 核心云端解码器
-        :param in_dim: 边缘端传来的特征维度 (比如 1024)
-        :param llm_dim: 云端 TinyLlama 的隐层维度 (2048)
-        :param num_queries: 固定输出的 Token 数量 (M=128)
-        """
+    # 【修改点】：llm_dim 从 2048 改为 4096，迎合 7B 级别大模型
+    def __init__(self, in_dim=1024, llm_dim=4096, num_queries=128, num_heads=8):
         super().__init__()
         self.num_queries = num_queries
         self.llm_dim = llm_dim
         
-        # 1. 云端侦探：可学习的 Query 向量 [1, 128, 2048]
+        # 剩下的代码完全不用动，因为所有线性层和 Attention 都会自动读取这个 4096
         self.queries = nn.Parameter(torch.randn(1, num_queries, llm_dim))
-        
-        # 2. 维度投影：先把边缘端 1024 维拉升到 2048 维，方便做 Attention
         self.kv_proj = nn.Linear(in_dim, llm_dim)
         
         # 3. 交叉注意力机制 (核心)
