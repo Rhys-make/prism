@@ -48,13 +48,20 @@ def build_vision_projector(config, delay_load=False, **kwargs):
     if projector_type == 'identity':
         return IdentityMap()
 
+    if projector_type == 'adp':
+        return SemanticResampler(
+            in_dim=1024,
+            llm_dim=4096,
+            num_queries=128
+        )
+
     # 🌟 注入你的自研 Prism-ADP 架构
     # 🌟 接入 Prism-ADP
     if projector_type == 'prism_adp':
         return SemanticResampler(
-            in_dim=config.mm_hidden_size,    # 传入 1024
-            llm_dim=config.hidden_size,      # 传入 4096
-            num_queries=128                  # 保持和你 Stage 1 训练时一致
+            in_dim=config.mm_hidden_size,
+            llm_dim=config.hidden_size,
+            num_queries=128
         )
 
     raise ValueError(f'Unknown projector type: {projector_type}')

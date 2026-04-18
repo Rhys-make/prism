@@ -1,7 +1,13 @@
+import os
+import sys
+
 import torch
 import torch.nn as nn
 
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../../edge")))
+import tome
 
 
 class CLIPVisionTower(nn.Module):
@@ -28,6 +34,7 @@ class CLIPVisionTower(nn.Module):
 
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
         self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        tome.patch.clip(self.vision_tower, r=16)
         self.vision_tower.requires_grad_(False)
 
         self.is_loaded = True
@@ -105,7 +112,6 @@ class CLIPVisionTowerS2(CLIPVisionTower):
             raise ImportError('Package s2wrapper not found! Please install by running: \npip install git+https://github.com/bfshi/scaling_on_scales.git')
         self.multiscale_forward = multiscale_forward
 
-        # change resize/crop size in preprocessing to the largest image size in s2_scale
         if not delay_load or getattr(args, 'unfreeze_mm_vision_tower', False):
             self.image_processor.size['shortest_edge'] = self.s2_image_size
             self.image_processor.crop_size['height'] = self.image_processor.crop_size['width'] = self.s2_image_size
@@ -117,6 +123,7 @@ class CLIPVisionTowerS2(CLIPVisionTower):
 
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
         self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        tome.patch.clip(self.vision_tower, r=16)
         self.vision_tower.requires_grad_(False)
 
         self.image_processor.size['shortest_edge'] = self.s2_image_size
