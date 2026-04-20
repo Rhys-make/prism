@@ -6,8 +6,8 @@ import torch.nn as nn
 
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../../edge")))
-import tome
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../")))
+import edge.tome as tome
 
 
 class CLIPVisionTower(nn.Module):
@@ -34,7 +34,8 @@ class CLIPVisionTower(nn.Module):
 
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
         self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
-        tome.patch.clip(self.vision_tower, r=16)
+        tome.patch.clip(self.vision_tower)
+        self.vision_tower.r = 16
         self.vision_tower.requires_grad_(False)
 
         self.is_loaded = True
@@ -95,7 +96,6 @@ class CLIPVisionTower(nn.Module):
         return (self.config.image_size // self.config.patch_size) ** 2
 
 
-
 class CLIPVisionTowerS2(CLIPVisionTower):
     def __init__(self, vision_tower, args, delay_load=False):
         super().__init__(vision_tower, args, delay_load)
@@ -123,7 +123,8 @@ class CLIPVisionTowerS2(CLIPVisionTower):
 
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
         self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
-        tome.patch.clip(self.vision_tower, r=16)
+        tome.patch.clip(self.vision_tower)
+        self.vision_tower.r = 16
         self.vision_tower.requires_grad_(False)
 
         self.image_processor.size['shortest_edge'] = self.s2_image_size

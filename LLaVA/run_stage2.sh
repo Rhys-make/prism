@@ -1,12 +1,14 @@
 #!/bin/bash
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
-deepspeed llava/train/train_mem.py \
+deepspeed llava/train/train.py \
     --deepspeed ./scripts/zero3.json \
-    --model_name_or_path lmsys/vicuna-7b-v1.5 \
-    --version v1.5 \
+    --model_name_or_path /data/wangwenbin/sunxuze/prism/models/vicuna-7b-v1.5 \
+    --version v1 \
     --data_path /data/wangwenbin/sunxuze/prism/data/llava_v1_5_mix665k.json \
     --image_folder /data/wangwenbin/sunxuze/prism/data \
-    --vision_tower openai/clip-vit-large-patch14-336 \
+    --vision_tower /data/wangwenbin/sunxuze/prism/models/clip-vit-large-patch14-336 \
     --pretrain_mm_mlp_adapter ./checkpoints/prism-stage1/mm_projector.bin \
     --mm_projector_type adp \
     --mm_vision_select_layer -2 \

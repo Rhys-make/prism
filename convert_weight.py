@@ -3,7 +3,7 @@ import os
 import torch
 
 
-SOURCE_PATH = "/data/wangwenbin/sunxuze/prism/prism_adp_epoch_1.pth"
+SOURCE_PATH = "/data/wangwenbin/sunxuze/prism/checkpoints/prism_adp_epoch_1.pth"
 TARGET_PATH = "/data/wangwenbin/sunxuze/prism/LLaVA/checkpoints/prism-stage1/mm_projector.bin"
 PREFIX = "model.mm_projector."
 
