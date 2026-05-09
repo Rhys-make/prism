@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .adp import SemanticResampler
 from .builder import MMConfig
+from .perceiver import PerceiverResampler
 from .projector import build_projector
 from .vision import VisionSpec, VisionTowerWrapper
 
@@ -27,15 +27,16 @@ class PrismMultiModalModel(nn.Module):
             raise ValueError("无法推断 vision hidden size。")
 
         self.projector_type = config.projector_type
-        if config.projector_type == "adp":
-            self.projector = SemanticResampler(
-                in_dim=vision_dim,
-                hidden_size=config.hidden_size,
-                num_queries=config.num_queries,
-                num_heads=8,
+        if config.projector_type == "perceiver":
+            self.projector = PerceiverResampler(
+                dim=vision_dim,
                 depth=max(2, config.mlp_depth),
-                dropout=0.0,
-                use_input_skip=True,
+                dim_head=64,
+                heads=8,
+                num_latents=config.num_queries,
+                max_num_media=16,
+                max_num_frames=None,
+                ff_mult=4,
             )
         else:
             self.projector = build_projector(
@@ -56,9 +57,13 @@ class PrismMultiModalModel(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
+    def _projector_dtype(self) -> torch.dtype:
+        return next(self.projector.parameters()).dtype
+
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         feats = self.vision(pixel_values)
         feats = feats[:, 1:, :]  # 去掉 CLS token
+        feats = feats.to(dtype=self._projector_dtype())
         return self.projector(feats)
 
     def _merge_text_and_image_embeddings(
@@ -69,9 +74,7 @@ class PrismMultiModalModel(nn.Module):
         labels: Optional[torch.Tensor],
     ):
         """把图像 token 前置到文本 token 前面，并同步对齐 mask 和 labels。"""
-        bsz, img_len, hidden = image_embeds.shape
-        _, txt_len, _ = text_embeds.shape
-
+        bsz, img_len, _ = image_embeds.shape
         inputs_embeds = torch.cat([image_embeds, text_embeds], dim=1)
 
         if attention_mask is not None:
@@ -95,9 +98,10 @@ class PrismMultiModalModel(nn.Module):
         **kwargs,
     ):
         text_embeds = self.llm.get_input_embeddings()(input_ids)
+        projector_dtype = self._projector_dtype()
 
         if compressed_features is not None:
-            image_tokens = compressed_features.to(text_embeds.device)
+            image_tokens = compressed_features.to(text_embeds.device, dtype=projector_dtype)
             if image_tokens.ndim == 2:
                 image_tokens = image_tokens.unsqueeze(0)
 
@@ -105,12 +109,11 @@ class PrismMultiModalModel(nn.Module):
                 compressed_attention_mask = compressed_attention_mask.to(text_embeds.device)
                 if compressed_attention_mask.ndim == 1:
                     compressed_attention_mask = compressed_attention_mask.unsqueeze(0)
-            # 如果压缩后的特征仍然处于 vision 维度，就先投影到 LLM hidden size。
-            if image_tokens.shape[-1] != self.config.hidden_size:
-                if self.projector_type == "adp":
-                    image_embeds = self.projector(image_tokens, attention_mask=compressed_attention_mask)
-                else:
-                    image_embeds = self.projector(image_tokens)
+
+            if self.projector_type == "perceiver":
+                image_embeds = self.projector(image_tokens, attention_mask=compressed_attention_mask)
+            elif image_tokens.shape[-1] != self.config.hidden_size:
+                image_embeds = self.projector(image_tokens)
             else:
                 image_embeds = image_tokens
         elif pixel_values is not None:
@@ -119,6 +122,7 @@ class PrismMultiModalModel(nn.Module):
             image_embeds = None
 
         if image_embeds is not None:
+            image_embeds = image_embeds.to(dtype=text_embeds.dtype)
             inputs_embeds, attention_mask, labels = self._merge_text_and_image_embeddings(
                 text_embeds=text_embeds,
                 image_embeds=image_embeds,
