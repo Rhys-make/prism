@@ -5,7 +5,7 @@ from typing import Literal, Optional
 
 from .modeling_mm import PrismMultiModalModel
 
-ProjectorType = Literal["linear", "mlp", "adp"]
+ProjectorType = Literal["linear", "mlp", "perceiver"]
 
 
 @dataclass
@@ -23,5 +23,5 @@ class MMConfig:
 
 
 def build_model(config: MMConfig) -> PrismMultiModalModel:
-    """Build the TinyLlama multimodal skeleton."""
+    """构建 Prism 多模态模型。"""
     return PrismMultiModalModel(config)

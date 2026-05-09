@@ -4,10 +4,12 @@ import argparse
 import json
 import os
 from dataclasses import asdict
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, random_split
 from transformers import get_cosine_schedule_with_warmup
+from tqdm.auto import tqdm
 
 from .builder import MMConfig, build_model
 from .collator import SimpleCollator
@@ -24,6 +26,8 @@ from .dataset import CompressedFeatureDataset
 # - 加载离线压缩特征数据集
 # - 划分训练 / 验证集
 # - 执行梯度累积、优化器更新、学习率调度、保存 checkpoint
+# - 记录训练日志 / 验证日志
+# - 显示进度条
 #
 # 这里默认 stage1 训练是冻结 LLM 和 vision tower，只训练 projector / ADP。
 
@@ -59,38 +63,38 @@ def load_dataset(path: str, tokenizer):
 
     支持两种输入：
     - 单个 .pt 文件
-    - 包含多个 .pt 样本文件的目录
+    - 包含多个 .pt 样本文件的目录（支持递归搜索）
     """
-    if os.path.isdir(path):
-        shards = []
-        for fn in sorted(os.listdir(path)):
-            if fn.endswith(".pt"):
-                shards.append(CompressedFeatureDataset(os.path.join(path, fn), tokenizer=tokenizer))
-        if not shards:
+    p = Path(path)
+    if p.is_file() and p.suffix == ".pt":
+        return CompressedFeatureDataset(path, tokenizer=tokenizer)
+
+    if p.is_dir():
+        pt_files = [str(x) for x in p.rglob("*.pt") if x.name not in {"best.pt", "last.pt"}]
+        if not pt_files:
             raise ValueError(f"{path} 下没有找到 .pt shard。")
 
-        class _Concat(torch.utils.data.Dataset):
-            def __init__(self, parts):
-                self.parts = parts
-                self.offsets = []
-                s = 0
-                for p in parts:
-                    s += len(p)
-                    self.offsets.append(s)
+        # 递归收集到的 .pt 样本可以直接交给同一个 Dataset 处理。
+        class _VirtualShardDataset(torch.utils.data.Dataset):
+            def __init__(self, files, tokenizer):
+                self.files = [Path(f) for f in files]
+                self.tokenizer = tokenizer
 
             def __len__(self):
-                return self.offsets[-1]
+                return len(self.files)
 
             def __getitem__(self, idx):
-                for pi, off in enumerate(self.offsets):
-                    if idx < off:
-                        prev = 0 if pi == 0 else self.offsets[pi - 1]
-                        return self.parts[pi][idx - prev]
-                raise IndexError(idx)
+                # 复用 CompressedFeatureDataset 对单个 .pt 的解析逻辑。
+                return CompressedFeatureDataset(str(self.files[idx]), tokenizer=self.tokenizer)[0]
 
-        return _Concat(shards)
+        return _VirtualShardDataset(pt_files, tokenizer=tokenizer)
 
-    return CompressedFeatureDataset(path, tokenizer=tokenizer)
+    raise ValueError(f"无效的数据路径: {path}")
+
+
+def _log_jsonl(path: str, record: dict):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def main():
@@ -163,6 +167,8 @@ def main():
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
+    train_log_path = os.path.join(args.output_dir, "train_log.jsonl")
+    eval_log_path = os.path.join(args.output_dir, "eval_log.jsonl")
     with open(os.path.join(args.output_dir, "train_config.json"), "w", encoding="utf-8") as f:
         json.dump({**vars(args), **asdict(config)}, f, indent=2, ensure_ascii=False)
 
@@ -172,9 +178,22 @@ def main():
         running_loss = 0.0
         optim.zero_grad(set_to_none=True)
 
+        progress = tqdm(total=len(train_loader), desc=f"Train {epoch + 1}/{args.epochs}", dynamic_ncols=True)
         for step, batch in enumerate(train_loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            out = model(**batch)
+            # 只保留模型 forward 真正需要的字段，避免把统计字段传进 LLM。
+            model_batch = {
+                "input_ids": batch["input_ids"].to(device),
+                "attention_mask": batch["attention_mask"].to(device),
+                "labels": batch.get("labels").to(device) if batch.get("labels") is not None else None,
+            }
+            if "pixel_values" in batch:
+                model_batch["pixel_values"] = batch["pixel_values"].to(device)
+            if "compressed_features" in batch:
+                model_batch["compressed_features"] = batch["compressed_features"].to(device)
+            if "compressed_attention_mask" in batch:
+                model_batch["compressed_attention_mask"] = batch["compressed_attention_mask"].to(device)
+
+            out = model(**model_batch)
             loss = out.loss / max(1, args.gradient_accumulation_steps)
             loss.backward()
             running_loss += loss.item()
@@ -188,24 +207,63 @@ def main():
                 optim.zero_grad(set_to_none=True)
                 global_step += 1
 
+                lr = sched.get_last_lr()[0] if hasattr(sched, "get_last_lr") else args.lr
+                _log_jsonl(
+                    train_log_path,
+                    {
+                        "type": "train",
+                        "epoch": epoch,
+                        "step": global_step,
+                        "loss": float(running_loss),
+                        "lr": float(lr),
+                    },
+                )
+
                 if global_step % 10 == 0:
-                    print(f"epoch={epoch} step={global_step} loss={running_loss:.4f}")
+                    progress.set_postfix(loss=f"{running_loss:.4f}", step=global_step)
                 running_loss = 0.0
 
                 if args.save_steps > 0 and global_step % args.save_steps == 0:
                     ckpt = os.path.join(args.output_dir, f"checkpoint-{global_step}.pt")
                     torch.save({"model": model.state_dict(), "step": global_step}, ckpt)
 
+            progress.update(1)
+            progress.set_postfix(step=global_step)
+        progress.close()
+
         if eval_loader is not None:
             model.eval()
             losses = []
+            eval_progress = tqdm(total=len(eval_loader), desc=f"Eval {epoch + 1}/{args.epochs}", dynamic_ncols=True)
             with torch.no_grad():
                 for batch in eval_loader:
-                    batch = {k: v.to(device) for k, v in batch.items()}
-                    out = model(**batch)
+                    model_batch = {
+                        "input_ids": batch["input_ids"].to(device),
+                        "attention_mask": batch["attention_mask"].to(device),
+                        "labels": batch.get("labels").to(device) if batch.get("labels") is not None else None,
+                    }
+                    if "pixel_values" in batch:
+                        model_batch["pixel_values"] = batch["pixel_values"].to(device)
+                    if "compressed_features" in batch:
+                        model_batch["compressed_features"] = batch["compressed_features"].to(device)
+                    if "compressed_attention_mask" in batch:
+                        model_batch["compressed_attention_mask"] = batch["compressed_attention_mask"].to(device)
+
+                    out = model(**model_batch)
                     losses.append(out.loss.item())
+                    eval_progress.update(1)
+            eval_progress.close()
             eval_loss = float(sum(losses) / max(1, len(losses)))
             print(f"[eval] epoch={epoch} loss={eval_loss:.4f}")
+            _log_jsonl(
+                eval_log_path,
+                {
+                    "type": "eval",
+                    "epoch": epoch,
+                    "step": global_step,
+                    "eval_loss": float(eval_loss),
+                },
+            )
             if eval_loss < best_eval:
                 best_eval = eval_loss
                 torch.save({"model": model.state_dict(), "step": global_step}, os.path.join(args.output_dir, "best.pt"))
