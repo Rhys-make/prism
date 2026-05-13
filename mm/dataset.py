@@ -138,6 +138,80 @@ def _build_tinyllama_chat_example(tokenizer, turns: Sequence[Tuple[str, str]]) -
     return input_ids_t, attention_mask_t, labels_t
 
 
+def load_compressed_features_from_payload(payload: Dict[str, Any]) -> torch.Tensor:
+    """Load compressed visual features, dequantizing int8 payloads when needed."""
+    if "compressed_features" in payload:
+        compressed_features = payload["compressed_features"]
+        if not isinstance(compressed_features, torch.Tensor):
+            compressed_features = torch.as_tensor(compressed_features)
+        return compressed_features
+
+    if "compressed_features_q" in payload and "compressed_features_scale" in payload:
+        q = payload["compressed_features_q"]
+        scale = payload["compressed_features_scale"]
+        if not isinstance(q, torch.Tensor):
+            q = torch.as_tensor(q)
+        if not isinstance(scale, torch.Tensor):
+            scale = torch.as_tensor(scale)
+        return q.float() * scale.float()
+
+    raise KeyError("payload 中缺少 compressed_features 或 int8 量化特征字段。")
+
+
+_DTYPE_MAP = {
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
+
+
+def _read_binary_tensor(root: Path, spec: Dict[str, Any]) -> torch.Tensor:
+    dtype = _DTYPE_MAP[str(spec["dtype"])]
+    numel = int(spec["numel"])
+    shape = tuple(int(x) for x in spec["shape"])
+    offset = int(spec["offset"])
+    nbytes = numel * torch.empty((), dtype=dtype).element_size()
+    path = root / spec["path"]
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read(nbytes)
+    if len(data) != nbytes:
+        raise ValueError(f"读取 {path} 失败：期望 {nbytes} bytes，实际 {len(data)} bytes。")
+    return torch.frombuffer(bytearray(data), dtype=dtype).clone().reshape(shape)
+
+
+def load_compressed_features_from_manifest(record: Dict[str, Any], root: Path) -> torch.Tensor:
+    storage = record.get("compressed_feature_storage")
+    if storage == "int8_symmetric_per_token":
+        q = _read_binary_tensor(root, record["features"])
+        scale = _read_binary_tensor(root, record["feature_scales"])
+        return q.float() * scale.float()
+    if "features" in record:
+        return _read_binary_tensor(root, record["features"])
+    raise KeyError("manifest record 中缺少 features 字段。")
+
+
+def _load_manifest_records(root_path: str) -> List[Tuple[Path, Dict[str, Any]]]:
+    root = Path(root_path)
+    manifest_paths = [root] if root.is_file() and root.name.endswith(".jsonl") else sorted(root.rglob("manifest.jsonl"))
+    records: List[Tuple[Path, Dict[str, Any]]] = []
+    for manifest_path in manifest_paths:
+        shard_root = manifest_path.parent
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if "meta" in rec:
+                    continue
+                if "features" in rec:
+                    records.append((shard_root, rec))
+    return records
+
+
 # -----------------------------
 # 原始 JSON 数据集
 # -----------------------------
@@ -206,9 +280,7 @@ class CompressedFeatureDataset(Dataset):
         turns = _normalize_turns(payload.get("conversations", []))
         input_ids, attention_mask, labels = _build_tinyllama_chat_example(self.tokenizer, turns)
 
-        compressed_features = payload["compressed_features"]
-        if not isinstance(compressed_features, torch.Tensor):
-            compressed_features = torch.as_tensor(compressed_features)
+        compressed_features = load_compressed_features_from_payload(payload)
 
         # 保存一个与压缩特征等长的 mask，后续 collator 会做 padding。
         compressed_attention_mask = torch.ones(compressed_features.shape[0], dtype=torch.long)
@@ -223,3 +295,43 @@ class CompressedFeatureDataset(Dataset):
             "target_keep_tokens": payload.get("target_keep_tokens"),
             "drop_tokens": payload.get("drop_tokens"),
         }
+
+
+class BinaryCompressedFeatureDataset(Dataset):
+    """读取 compact bin + manifest.jsonl 格式的压缩特征数据集。"""
+
+    def __init__(self, root_path: str, tokenizer):
+        self.tokenizer = tokenizer
+        self.records = _load_manifest_records(root_path)
+        if not self.records:
+            raise ValueError(f"{root_path} 下没有找到 bin manifest 样本记录")
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        shard_root, record = self.records[idx]
+
+        turns = _normalize_turns(record.get("conversations", []))
+        input_ids, attention_mask, labels = _build_tinyllama_chat_example(self.tokenizer, turns)
+
+        compressed_features = load_compressed_features_from_manifest(record, shard_root)
+        compressed_attention_mask = torch.ones(compressed_features.shape[0], dtype=torch.long)
+
+        sample = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "compressed_features": compressed_features,
+            "compressed_attention_mask": compressed_attention_mask,
+            "retain_ratio": record.get("retain_ratio"),
+            "target_keep_tokens": record.get("target_keep_tokens"),
+            "drop_tokens": record.get("drop_tokens"),
+        }
+
+        if record.get("source_encoding") == "csr_binary_patch_i16":
+            sample["source_indices"] = _read_binary_tensor(shard_root, record["source_indices"])
+            sample["source_offsets"] = _read_binary_tensor(shard_root, record["source_offsets"])
+            sample["grid_shape"] = torch.tensor(record.get("grid_shape", [24, 24]), dtype=torch.long)
+
+        return sample
