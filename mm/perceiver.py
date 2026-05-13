@@ -49,6 +49,15 @@ class PerceiverAttention(nn.Module):
         v = v.reshape(v.shape[0], v.shape[1], h, -1).transpose(1, 2)
         q = q * self.scale
         sim = torch.einsum("b h i d, b h j d -> b h i j", q, k)
+        if media_padding_mask is not None:
+            latent_mask = torch.ones(
+                media_padding_mask.shape[0],
+                latents.shape[1],
+                dtype=torch.bool,
+                device=media_padding_mask.device,
+            )
+            kv_mask = torch.cat([media_padding_mask.bool(), latent_mask], dim=1)
+            sim = sim.masked_fill(~kv_mask[:, None, None, :], torch.finfo(sim.dtype).min)
         sim = sim - sim.amax(dim=-1, keepdim=True).detach()
         attn = sim.softmax(dim=-1)
         out = torch.einsum("b h i j, b h j d -> b h i d", attn, v)
