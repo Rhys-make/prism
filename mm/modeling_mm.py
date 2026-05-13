@@ -5,6 +5,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from .perceiver import PerceiverResampler
 from .projector import build_projector
+from .source_packer import SourceAwareTokenPackerLite
 from .vision import VisionSpec, VisionTowerWrapper
 if TYPE_CHECKING:
     from .builder import MMConfig
@@ -32,6 +33,17 @@ class PrismMultiModalModel(nn.Module):
                 max_num_frames=None,
                 ff_mult=4,
                 out_dim=config.hidden_size,
+            )
+        elif config.projector_type == "source_packer":
+            self.projector = SourceAwareTokenPackerLite(
+                in_dim=vision_dim,
+                out_dim=config.hidden_size,
+                num_queries=config.num_queries,
+                depth=max(1, config.mlp_depth),
+                dim_head=64,
+                heads=8,
+                ff_mult=4,
+                local_topk=8,
             )
         else:
             self.projector = build_projector(
@@ -81,6 +93,8 @@ class PrismMultiModalModel(nn.Module):
         pixel_values: Optional[torch.Tensor] = None,
         compressed_features: Optional[torch.Tensor] = None,
         compressed_attention_mask: Optional[torch.Tensor] = None,
+        token_centers: Optional[torch.Tensor] = None,
+        token_sizes: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         text_embeds = self.llm.get_input_embeddings()(input_ids)
@@ -95,6 +109,21 @@ class PrismMultiModalModel(nn.Module):
                     compressed_attention_mask = compressed_attention_mask.unsqueeze(0)
             if self.projector_type == "perceiver":
                 image_embeds = self.projector(image_tokens, attention_mask=compressed_attention_mask)
+            elif self.projector_type == "source_packer":
+                if token_centers is not None:
+                    token_centers = token_centers.to(text_embeds.device)
+                    if token_centers.ndim == 2:
+                        token_centers = token_centers.unsqueeze(0)
+                if token_sizes is not None:
+                    token_sizes = token_sizes.to(text_embeds.device)
+                    if token_sizes.ndim == 1:
+                        token_sizes = token_sizes.unsqueeze(0)
+                image_embeds = self.projector(
+                    image_tokens,
+                    attention_mask=compressed_attention_mask,
+                    token_centers=token_centers,
+                    token_sizes=token_sizes,
+                )
             elif image_tokens.shape[-1] != self.config.hidden_size:
                 image_embeds = self.projector(image_tokens)
             else:

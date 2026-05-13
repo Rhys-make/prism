@@ -193,6 +193,39 @@ def load_compressed_features_from_manifest(record: Dict[str, Any], root: Path) -
     raise KeyError("manifest record 中缺少 features 字段。")
 
 
+def compute_source_geometry(
+    source_indices: torch.Tensor,
+    source_offsets: torch.Tensor,
+    grid_shape: torch.Tensor | Sequence[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert CSR ToMe source map into normalized token centers and sizes."""
+    if isinstance(grid_shape, torch.Tensor):
+        h, w = [int(x) for x in grid_shape.flatten().tolist()[:2]]
+    else:
+        h, w = [int(x) for x in list(grid_shape)[:2]]
+    total = max(1, h * w)
+    offsets = source_offsets.to(torch.long).flatten()
+    indices = source_indices.to(torch.long).flatten()
+    num_tokens = max(0, int(offsets.numel()) - 1)
+
+    centers = torch.zeros((num_tokens, 2), dtype=torch.float32)
+    sizes = torch.zeros((num_tokens,), dtype=torch.float32)
+
+    for i in range(num_tokens):
+        start = int(offsets[i].item())
+        end = int(offsets[i + 1].item())
+        patch_ids = indices[start:end]
+        if patch_ids.numel() == 0:
+            continue
+        rows = torch.div(patch_ids, w, rounding_mode="floor").float()
+        cols = (patch_ids % w).float()
+        centers[i, 0] = (cols.mean() + 0.5) / float(w)
+        centers[i, 1] = (rows.mean() + 0.5) / float(h)
+        sizes[i] = float(patch_ids.numel()) / float(total)
+
+    return centers, sizes
+
+
 def _load_manifest_records(root_path: str) -> List[Tuple[Path, Dict[str, Any]]]:
     root = Path(root_path)
     manifest_paths = [root] if root.is_file() and root.name.endswith(".jsonl") else sorted(root.rglob("manifest.jsonl"))
@@ -285,7 +318,7 @@ class CompressedFeatureDataset(Dataset):
         # 保存一个与压缩特征等长的 mask，后续 collator 会做 padding。
         compressed_attention_mask = torch.ones(compressed_features.shape[0], dtype=torch.long)
 
-        return {
+        sample = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
@@ -295,6 +328,21 @@ class CompressedFeatureDataset(Dataset):
             "target_keep_tokens": payload.get("target_keep_tokens"),
             "drop_tokens": payload.get("drop_tokens"),
         }
+        if payload.get("source_encoding") == "csr_binary_patch_i16":
+            source_indices = payload["source_indices"]
+            source_offsets = payload["source_offsets"]
+            if not isinstance(source_indices, torch.Tensor):
+                source_indices = torch.as_tensor(source_indices)
+            if not isinstance(source_offsets, torch.Tensor):
+                source_offsets = torch.as_tensor(source_offsets)
+            centers, sizes = compute_source_geometry(
+                source_indices=source_indices,
+                source_offsets=source_offsets,
+                grid_shape=payload.get("grid_shape", [24, 24]),
+            )
+            sample["token_centers"] = centers
+            sample["token_sizes"] = sizes
+        return sample
 
 
 class BinaryCompressedFeatureDataset(Dataset):
@@ -330,8 +378,14 @@ class BinaryCompressedFeatureDataset(Dataset):
         }
 
         if record.get("source_encoding") == "csr_binary_patch_i16":
-            sample["source_indices"] = _read_binary_tensor(shard_root, record["source_indices"])
-            sample["source_offsets"] = _read_binary_tensor(shard_root, record["source_offsets"])
-            sample["grid_shape"] = torch.tensor(record.get("grid_shape", [24, 24]), dtype=torch.long)
+            source_indices = _read_binary_tensor(shard_root, record["source_indices"])
+            source_offsets = _read_binary_tensor(shard_root, record["source_offsets"])
+            centers, sizes = compute_source_geometry(
+                source_indices=source_indices,
+                source_offsets=source_offsets,
+                grid_shape=record.get("grid_shape", [24, 24]),
+            )
+            sample["token_centers"] = centers
+            sample["token_sizes"] = sizes
 
         return sample

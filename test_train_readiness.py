@@ -36,24 +36,33 @@ def build_fake_batch(model, projector_type: str, device: torch.device) -> dict[s
         # perceiver 会读取变长 token 并输出固定 latent，所以这里给一个变长序列。
         compressed_features = torch.randn(1, 32, 1024, device=device)
         compressed_attention_mask = torch.ones(1, 32, dtype=torch.long, device=device)
+    elif projector_type == "source_packer":
+        compressed_features = torch.randn(1, 32, 1024, device=device)
+        compressed_attention_mask = torch.ones(1, 32, dtype=torch.long, device=device)
     else:
         compressed_features = torch.randn(1, 32, 1024, device=device)
         compressed_attention_mask = torch.ones(1, 32, dtype=torch.long, device=device)
 
-    return {
+    batch = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
         "compressed_features": compressed_features,
         "compressed_attention_mask": compressed_attention_mask,
     }
+    if projector_type == "source_packer":
+        centers = torch.rand(1, 32, 2, device=device)
+        sizes = torch.full((1, 32), 1.0 / 576.0, device=device)
+        batch["token_centers"] = centers
+        batch["token_sizes"] = sizes
+    return batch
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Sanity check for stage1 training readiness.")
     parser.add_argument("--llm_name_or_path", type=str, required=True)
     parser.add_argument("--vision_name_or_path", type=str, required=True)
-    parser.add_argument("--projector_type", type=str, default="linear", choices=["linear", "mlp", "perceiver"])
+    parser.add_argument("--projector_type", type=str, default="linear", choices=["linear", "mlp", "perceiver", "source_packer"])
     parser.add_argument("--data_path", type=str, default=None)
     parser.add_argument("--num_queries", type=int, default=128)
     parser.add_argument("--mlp_depth", type=int, default=2)
