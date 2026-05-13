@@ -18,6 +18,7 @@ from .dataset import (
     CompressedFeatureDataset,
     _build_tinyllama_chat_example,
     _normalize_turns,
+    compute_source_geometry,
     load_compressed_features_from_payload,
 )
 
@@ -47,7 +48,7 @@ def parse_args():
         "--projector_type",
         type=str,
         default="perceiver",
-        choices=["linear", "mlp", "perceiver"],
+        choices=["linear", "mlp", "perceiver", "source_packer"],
         help="云端视觉适配模块类型。",
     )
     parser.add_argument("--data_path", type=str, required=True, help="离线压缩特征目录或单个 .pt 文件路径。")
@@ -92,7 +93,7 @@ class _VirtualShardDataset(torch.utils.data.Dataset):
         compressed_features = load_compressed_features_from_payload(payload)
         compressed_attention_mask = torch.ones(compressed_features.shape[0], dtype=torch.long)
 
-        return {
+        sample = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
@@ -102,6 +103,21 @@ class _VirtualShardDataset(torch.utils.data.Dataset):
             "target_keep_tokens": payload.get("target_keep_tokens"),
             "drop_tokens": payload.get("drop_tokens"),
         }
+        if payload.get("source_encoding") == "csr_binary_patch_i16":
+            source_indices = payload["source_indices"]
+            source_offsets = payload["source_offsets"]
+            if not isinstance(source_indices, torch.Tensor):
+                source_indices = torch.as_tensor(source_indices)
+            if not isinstance(source_offsets, torch.Tensor):
+                source_offsets = torch.as_tensor(source_offsets)
+            centers, sizes = compute_source_geometry(
+                source_indices=source_indices,
+                source_offsets=source_offsets,
+                grid_shape=payload.get("grid_shape", [24, 24]),
+            )
+            sample["token_centers"] = centers
+            sample["token_sizes"] = sizes
+        return sample
 
 
 def load_dataset(path: str, tokenizer):
@@ -241,6 +257,10 @@ def main():
                 model_batch["compressed_features"] = batch["compressed_features"].to(device)
             if "compressed_attention_mask" in batch:
                 model_batch["compressed_attention_mask"] = batch["compressed_attention_mask"].to(device)
+            if "token_centers" in batch:
+                model_batch["token_centers"] = batch["token_centers"].to(device)
+            if "token_sizes" in batch:
+                model_batch["token_sizes"] = batch["token_sizes"].to(device)
 
             out = model(**model_batch)
             loss = out.loss / max(1, args.gradient_accumulation_steps)
@@ -293,6 +313,10 @@ def main():
                         model_batch["compressed_features"] = batch["compressed_features"].to(device)
                     if "compressed_attention_mask" in batch:
                         model_batch["compressed_attention_mask"] = batch["compressed_attention_mask"].to(device)
+                    if "token_centers" in batch:
+                        model_batch["token_centers"] = batch["token_centers"].to(device)
+                    if "token_sizes" in batch:
+                        model_batch["token_sizes"] = batch["token_sizes"].to(device)
 
                     out = model(**model_batch)
                     losses.append(out.loss.item())

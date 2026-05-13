@@ -5,7 +5,7 @@ from typing import Literal, Optional
 
 from .modeling_mm import PrismMultiModalModel
 
-ProjectorType = Literal["linear", "mlp", "perceiver"]
+ProjectorType = Literal["linear", "mlp", "perceiver", "source_packer"]
 
 
 @dataclass

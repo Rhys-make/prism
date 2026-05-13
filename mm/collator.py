@@ -51,6 +51,16 @@ class SimpleCollator:
                 am_tensors = [a if isinstance(a, torch.Tensor) else torch.as_tensor(a) for a in am]
                 batch["compressed_attention_mask"] = torch.nn.utils.rnn.pad_sequence(am_tensors, batch_first=True, padding_value=0)
 
+            if "token_centers" in instances[0]:
+                centers = [x["token_centers"] for x in instances]
+                center_tensors = [c if isinstance(c, torch.Tensor) else torch.as_tensor(c) for c in centers]
+                batch["token_centers"] = torch.nn.utils.rnn.pad_sequence(center_tensors, batch_first=True, padding_value=0.0)
+
+            if "token_sizes" in instances[0]:
+                sizes = [x["token_sizes"] for x in instances]
+                size_tensors = [s if isinstance(s, torch.Tensor) else torch.as_tensor(s) for s in sizes]
+                batch["token_sizes"] = torch.nn.utils.rnn.pad_sequence(size_tensors, batch_first=True, padding_value=0.0)
+
             for k in ["retain_ratio", "target_keep_tokens", "drop_tokens"]:
                 if k in instances[0] and instances[0][k] is not None:
                     batch[k] = torch.tensor([x[k] for x in instances], dtype=torch.float32 if k == "retain_ratio" else torch.long)
