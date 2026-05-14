@@ -74,12 +74,22 @@ class PrismMultiModalModel(nn.Module):
         image_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
+        image_attention_mask: Optional[torch.Tensor] = None,
     ):
         """把图像 token 前置到文本 token 前面，并同步对齐 mask 和 labels。"""
         bsz, img_len, _ = image_embeds.shape
         inputs_embeds = torch.cat([image_embeds, text_embeds], dim=1)
         if attention_mask is not None:
-            img_mask = torch.ones((bsz, img_len), dtype=attention_mask.dtype, device=attention_mask.device)
+            if image_attention_mask is None:
+                img_mask = torch.ones((bsz, img_len), dtype=attention_mask.dtype, device=attention_mask.device)
+            else:
+                img_mask = image_attention_mask.to(device=attention_mask.device, dtype=attention_mask.dtype)
+                if img_mask.ndim == 1:
+                    img_mask = img_mask.unsqueeze(0)
+                if img_mask.shape != (bsz, img_len):
+                    raise ValueError(
+                        f"image_attention_mask shape must be {(bsz, img_len)}, got {tuple(img_mask.shape)}"
+                    )
             attention_mask = torch.cat([img_mask, attention_mask], dim=1)
         if labels is not None:
             img_labels = torch.full((bsz, img_len), -100, dtype=labels.dtype, device=labels.device)
@@ -100,6 +110,7 @@ class PrismMultiModalModel(nn.Module):
         text_embeds = self.llm.get_input_embeddings()(input_ids)
         projector_dtype = self._projector_dtype()
         if compressed_features is not None:
+            image_attention_mask = None
             image_tokens = compressed_features.to(text_embeds.device, dtype=projector_dtype)
             if image_tokens.ndim == 2:
                 image_tokens = image_tokens.unsqueeze(0)
@@ -126,12 +137,16 @@ class PrismMultiModalModel(nn.Module):
                 )
             elif image_tokens.shape[-1] != self.config.hidden_size:
                 image_embeds = self.projector(image_tokens)
+                image_attention_mask = compressed_attention_mask
             else:
                 image_embeds = image_tokens
+                image_attention_mask = compressed_attention_mask
         elif pixel_values is not None:
             image_embeds = self.encode_images(pixel_values.to(text_embeds.device))
+            image_attention_mask = None
         else:
             image_embeds = None
+            image_attention_mask = None
         if image_embeds is not None:
             image_embeds = image_embeds.to(dtype=text_embeds.dtype)
             inputs_embeds, attention_mask, labels = self._merge_text_and_image_embeddings(
@@ -139,6 +154,7 @@ class PrismMultiModalModel(nn.Module):
                 image_embeds=image_embeds,
                 attention_mask=attention_mask,
                 labels=labels,
+                image_attention_mask=image_attention_mask,
             )
         else:
             inputs_embeds = text_embeds
