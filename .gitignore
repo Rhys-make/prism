@@ -39,4 +39,4 @@ imagenette/
 checkpoints/
 models/
 
-output/
+outputs/
