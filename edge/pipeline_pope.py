@@ -62,7 +62,19 @@ def parse_args() -> argparse.Namespace:
 
 def load_dataset(data_path: str) -> List[Dict]:
     with open(data_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        raw = f.read()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+    if isinstance(data, dict):
+        for key in ["data", "annotations", "samples"]:
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+
     if not isinstance(data, list):
         raise ValueError("Expected the POPE dataset JSON to be a list of samples.")
     return data
@@ -87,10 +99,28 @@ def make_fixed_assignment(samples: List[Dict], retain_ratios: List[float], seed:
 
 
 def resolve_image_path(image_folder: str, sample: Dict) -> Optional[str]:
-    image_file = sample.get("image")
+    image_file = sample.get("image") or sample.get("image_path") or sample.get("file_name")
+    if image_file is None and sample.get("image_id") is not None:
+        image_id = sample.get("image_id")
+        try:
+            image_file = f"COCO_val2014_{int(image_id):012d}.jpg"
+        except (TypeError, ValueError):
+            image_file = str(image_id)
     if not image_file:
         return None
-    return os.path.join(image_folder, image_file)
+
+    image_file = str(image_file)
+    candidates = []
+    if os.path.isabs(image_file):
+        candidates.append(image_file)
+    else:
+        candidates.append(os.path.join(image_folder, image_file))
+        candidates.append(os.path.join(image_folder, os.path.basename(image_file)))
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
 
 
 def normalize_pope_sample(sample: Dict) -> Dict:
@@ -101,11 +131,16 @@ def normalize_pope_sample(sample: Dict) -> Dict:
     if label is None:
         raise ValueError("POPE sample is missing label/answer.")
 
+    question = str(question).strip()
+    label = str(label).strip().lower()
+
     conversations = [
-        {"from": "human", "value": str(question)},
-        {"from": "gpt", "value": str(label)},
+        {"from": "human", "value": question},
+        {"from": "gpt", "value": label},
     ]
     normalized = dict(sample)
+    normalized["text"] = question
+    normalized["label"] = label
     normalized["conversations"] = conversations
     return normalized
 
