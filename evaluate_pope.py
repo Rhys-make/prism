@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -33,6 +34,13 @@ def parse_args():
     parser.add_argument("--freeze_llm", action="store_true", default=True)
     parser.add_argument("--freeze_vision", action="store_true", default=True)
     parser.add_argument("--use_tome", action="store_true", default=True)
+    parser.add_argument(
+        "--eval_mode",
+        type=str,
+        default="score",
+        choices=["score", "generate"],
+        help="score 比较 yes/no 候选答案似然；generate 使用自由生成并解析 yes/no。",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=8)
     parser.add_argument("--max_eval_samples", type=int, default=0, help="调试用；0 表示评测完整 POPE。")
     parser.add_argument("--output_path", type=str, default=None)
@@ -89,12 +97,18 @@ def _extract_prompt_and_label(tokenizer, sample: Dict[str, Any], device: torch.d
     return prompt_ids, prompt_attention_mask, label, label_text
 
 
+def _sync_device(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def _build_generation_inputs(model, sample: Dict[str, Any], prompt_ids: torch.Tensor, prompt_attention_mask: torch.Tensor):
     text_embeds = model.llm.get_input_embeddings()(prompt_ids)
     projector_dtype = model._projector_dtype()
     device = text_embeds.device
 
     image_attention_mask = None
+    projector_latency_ms = 0.0
     if "compressed_features" in sample:
         image_tokens = sample["compressed_features"].to(device, dtype=projector_dtype)
         if image_tokens.ndim == 2:
@@ -107,7 +121,11 @@ def _build_generation_inputs(model, sample: Dict[str, Any], prompt_ids: torch.Te
                 compressed_attention_mask = compressed_attention_mask.unsqueeze(0)
 
         if model.projector_type == "perceiver":
+            _sync_device(device)
+            start = time.perf_counter()
             image_embeds = model.projector(image_tokens, attention_mask=compressed_attention_mask)
+            _sync_device(device)
+            projector_latency_ms = (time.perf_counter() - start) * 1000
         elif model.projector_type == "source_packer":
             token_centers = sample.get("token_centers")
             token_sizes = sample.get("token_sizes")
@@ -119,14 +137,22 @@ def _build_generation_inputs(model, sample: Dict[str, Any], prompt_ids: torch.Te
                 token_sizes = token_sizes.to(device)
                 if token_sizes.ndim == 1:
                     token_sizes = token_sizes.unsqueeze(0)
+            _sync_device(device)
+            start = time.perf_counter()
             image_embeds = model.projector(
                 image_tokens,
                 attention_mask=compressed_attention_mask,
                 token_centers=token_centers,
                 token_sizes=token_sizes,
             )
+            _sync_device(device)
+            projector_latency_ms = (time.perf_counter() - start) * 1000
         elif image_tokens.shape[-1] != model.config.hidden_size:
+            _sync_device(device)
+            start = time.perf_counter()
             image_embeds = model.projector(image_tokens)
+            _sync_device(device)
+            projector_latency_ms = (time.perf_counter() - start) * 1000
             image_attention_mask = compressed_attention_mask
         else:
             image_embeds = image_tokens
@@ -135,7 +161,7 @@ def _build_generation_inputs(model, sample: Dict[str, Any], prompt_ids: torch.Te
         image_embeds = None
 
     if image_embeds is None:
-        return text_embeds, prompt_attention_mask
+        return text_embeds, prompt_attention_mask, projector_latency_ms
 
     image_embeds = image_embeds.to(dtype=text_embeds.dtype)
     inputs_embeds, attention_mask, _ = model._merge_text_and_image_embeddings(
@@ -145,7 +171,7 @@ def _build_generation_inputs(model, sample: Dict[str, Any], prompt_ids: torch.Te
         labels=None,
         image_attention_mask=image_attention_mask,
     )
-    return inputs_embeds, attention_mask
+    return inputs_embeds, attention_mask, projector_latency_ms
 
 
 def _parse_yes_no(text: str) -> Optional[str]:
@@ -164,13 +190,84 @@ def _parse_yes_no(text: str) -> Optional[str]:
     return None
 
 
+def _tokenize_candidate(tokenizer, text: str, device: torch.device) -> torch.Tensor:
+    ids = tokenizer(text, add_special_tokens=False).input_ids
+    if len(ids) > 0 and isinstance(ids[0], list):
+        ids = ids[0]
+    if not ids:
+        raise ValueError(f"Candidate text produced no tokens: {text!r}")
+    return torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+
+
+@torch.no_grad()
+def _score_one(model, tokenizer, sample: Dict[str, Any], device: torch.device):
+    extracted = _extract_prompt_and_label(tokenizer, sample, device)
+    if extracted is None:
+        return None
+    prompt_ids, prompt_attention_mask, label, label_text = extracted
+
+    _sync_device(device)
+    cloud_start = time.perf_counter()
+    prefix_embeds, prefix_attention_mask, projector_latency_ms = _build_generation_inputs(
+        model,
+        sample,
+        prompt_ids,
+        prompt_attention_mask,
+    )
+
+    scores: Dict[str, float] = {}
+    llm_scoring_latency_ms = 0.0
+    for candidate in ["yes", "no"]:
+        candidate_ids = _tokenize_candidate(tokenizer, candidate, device)
+        candidate_embeds = model.llm.get_input_embeddings()(candidate_ids)
+        inputs_embeds = torch.cat([prefix_embeds, candidate_embeds], dim=1)
+        candidate_attention = torch.ones_like(candidate_ids, device=device)
+        attention_mask = torch.cat([prefix_attention_mask, candidate_attention], dim=1)
+        labels = torch.full(
+            inputs_embeds.shape[:2],
+            -100,
+            dtype=torch.long,
+            device=device,
+        )
+        labels[:, -candidate_ids.shape[1] :] = candidate_ids
+
+        _sync_device(device)
+        score_start = time.perf_counter()
+        out = model.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
+        _sync_device(device)
+        llm_scoring_latency_ms += (time.perf_counter() - score_start) * 1000
+        scores[candidate] = -float(out.loss.item())
+
+    prediction = "yes" if scores["yes"] >= scores["no"] else "no"
+    cloud_latency_ms = (time.perf_counter() - cloud_start) * 1000
+    return {
+        "label": label,
+        "label_text": label_text,
+        "prediction": prediction,
+        "prediction_text": prediction,
+        "yes_score": scores["yes"],
+        "no_score": scores["no"],
+        "projector_latency_ms": projector_latency_ms,
+        "generation_latency_ms": 0.0,
+        "scoring_latency_ms": llm_scoring_latency_ms,
+        "cloud_latency_ms": cloud_latency_ms,
+    }
+
+
 @torch.no_grad()
 def _generate_one(model, tokenizer, sample: Dict[str, Any], device: torch.device, max_new_tokens: int):
     extracted = _extract_prompt_and_label(tokenizer, sample, device)
     if extracted is None:
         return None
     prompt_ids, prompt_attention_mask, label, label_text = extracted
-    inputs_embeds, attention_mask = _build_generation_inputs(model, sample, prompt_ids, prompt_attention_mask)
+    _sync_device(device)
+    cloud_start = time.perf_counter()
+    inputs_embeds, attention_mask, projector_latency_ms = _build_generation_inputs(
+        model,
+        sample,
+        prompt_ids,
+        prompt_attention_mask,
+    )
     input_len = inputs_embeds.shape[1]
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     eos_token_id = tokenizer.eos_token_id
@@ -180,6 +277,8 @@ def _generate_one(model, tokenizer, sample: Dict[str, Any], device: torch.device
         dtype=torch.long,
         device=device,
     )
+    _sync_device(device)
+    generation_start = time.perf_counter()
     generated = model.llm.generate(
         input_ids=dummy_input_ids,
         inputs_embeds=inputs_embeds,
@@ -189,6 +288,9 @@ def _generate_one(model, tokenizer, sample: Dict[str, Any], device: torch.device
         pad_token_id=pad_token_id,
         eos_token_id=eos_token_id,
     )
+    _sync_device(device)
+    generation_latency_ms = (time.perf_counter() - generation_start) * 1000
+    cloud_latency_ms = (time.perf_counter() - cloud_start) * 1000
     generated_ids = generated[0, input_len:] if generated.shape[1] > input_len else generated[0]
     prediction_text = tokenizer.decode(generated_ids.tolist(), skip_special_tokens=True).strip()
     prediction = _parse_yes_no(prediction_text)
@@ -197,6 +299,10 @@ def _generate_one(model, tokenizer, sample: Dict[str, Any], device: torch.device
         "label_text": label_text,
         "prediction": prediction,
         "prediction_text": prediction_text,
+        "projector_latency_ms": projector_latency_ms,
+        "generation_latency_ms": generation_latency_ms,
+        "scoring_latency_ms": 0.0,
+        "cloud_latency_ms": cloud_latency_ms,
     }
 
 
@@ -209,11 +315,29 @@ def _empty_stats() -> Dict[str, float]:
         "invalid": 0.0,
         "total": 0.0,
         "yes_predictions": 0.0,
+        "projector_latency_ms_sum": 0.0,
+        "generation_latency_ms_sum": 0.0,
+        "scoring_latency_ms_sum": 0.0,
+        "cloud_latency_ms_sum": 0.0,
+        "latency_count": 0.0,
     }
 
 
-def _update_stats(stats: Dict[str, float], label: str, prediction: Optional[str]):
+def _update_stats(
+    stats: Dict[str, float],
+    label: str,
+    prediction: Optional[str],
+    projector_latency_ms: float = 0.0,
+    generation_latency_ms: float = 0.0,
+    scoring_latency_ms: float = 0.0,
+    cloud_latency_ms: float = 0.0,
+):
     stats["total"] += 1
+    stats["projector_latency_ms_sum"] += float(projector_latency_ms)
+    stats["generation_latency_ms_sum"] += float(generation_latency_ms)
+    stats["scoring_latency_ms_sum"] += float(scoring_latency_ms)
+    stats["cloud_latency_ms_sum"] += float(cloud_latency_ms)
+    stats["latency_count"] += 1
     if prediction == "yes":
         stats["yes_predictions"] += 1
     if prediction not in {"yes", "no"}:
@@ -233,10 +357,12 @@ def _update_stats(stats: Dict[str, float], label: str, prediction: Optional[str]
 def _finalize(stats: Dict[str, float]) -> Dict[str, float]:
     tp, tn, fp, fn = stats["tp"], stats["tn"], stats["fp"], stats["fn"]
     total = max(1.0, stats["total"])
+    latency_count = max(1.0, stats["latency_count"])
     precision = tp / max(1.0, tp + fp)
     recall = tp / max(1.0, tp + fn)
     specificity = tn / max(1.0, tn + fp)
     f1 = 2 * precision * recall / max(1e-12, precision + recall)
+    cloud_latency_ms = stats["cloud_latency_ms_sum"] / latency_count
     return {
         "accuracy": float((tp + tn) / total),
         "precision": float(precision),
@@ -247,6 +373,11 @@ def _finalize(stats: Dict[str, float]) -> Dict[str, float]:
         "specificity": float(specificity),
         "yes_ratio": float(stats["yes_predictions"] / total),
         "invalid_ratio": float(stats["invalid"] / total),
+        "projector_latency_ms": float(stats["projector_latency_ms_sum"] / latency_count),
+        "generation_latency_ms": float(stats["generation_latency_ms_sum"] / latency_count),
+        "scoring_latency_ms": float(stats["scoring_latency_ms_sum"] / latency_count),
+        "cloud_latency_ms": float(cloud_latency_ms),
+        "samples_per_second": float(1000.0 / cloud_latency_ms) if cloud_latency_ms > 0 else None,
         "tp": int(tp),
         "tn": int(tn),
         "fp": int(fp),
@@ -264,7 +395,14 @@ def _retain_key(value: Any) -> str:
 
 
 @torch.no_grad()
-def evaluate(model, dataloader: DataLoader, device: torch.device, max_new_tokens: int, max_eval_samples: int = 0):
+def evaluate(
+    model,
+    dataloader: DataLoader,
+    device: torch.device,
+    eval_mode: str,
+    max_new_tokens: int,
+    max_eval_samples: int = 0,
+):
     model.eval()
     overall = _empty_stats()
     by_retain_ratio: Dict[str, Dict[str, float]] = {}
@@ -281,16 +419,35 @@ def evaluate(model, dataloader: DataLoader, device: torch.device, max_new_tokens
             if max_eval_samples > 0 and seen >= max_eval_samples:
                 break
             sample = _slice_batch_row(batch, i, batch_size)
-            result = _generate_one(model, model.tokenizer, sample, device, max_new_tokens=max_new_tokens)
+            if eval_mode == "score":
+                result = _score_one(model, model.tokenizer, sample, device)
+            else:
+                result = _generate_one(model, model.tokenizer, sample, device, max_new_tokens=max_new_tokens)
             if result is None:
                 seen += 1
                 continue
 
             retain_ratio = batch["retain_ratio"][i].item() if "retain_ratio" in batch else None
-            _update_stats(overall, result["label"], result["prediction"])
+            _update_stats(
+                overall,
+                result["label"],
+                result["prediction"],
+                projector_latency_ms=result["projector_latency_ms"],
+                generation_latency_ms=result["generation_latency_ms"],
+                scoring_latency_ms=result["scoring_latency_ms"],
+                cloud_latency_ms=result["cloud_latency_ms"],
+            )
             if retain_ratio is not None:
                 key = _retain_key(retain_ratio)
-                _update_stats(by_retain_ratio.setdefault(key, _empty_stats()), result["label"], result["prediction"])
+                _update_stats(
+                    by_retain_ratio.setdefault(key, _empty_stats()),
+                    result["label"],
+                    result["prediction"],
+                    projector_latency_ms=result["projector_latency_ms"],
+                    generation_latency_ms=result["generation_latency_ms"],
+                    scoring_latency_ms=result["scoring_latency_ms"],
+                    cloud_latency_ms=result["cloud_latency_ms"],
+                )
 
             predictions.append(
                 {
@@ -343,12 +500,20 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    metrics = evaluate(model, dataloader, device, args.max_new_tokens, args.max_eval_samples)
+    metrics = evaluate(
+        model,
+        dataloader,
+        device,
+        args.eval_mode,
+        args.max_new_tokens,
+        args.max_eval_samples,
+    )
     predictions = metrics.pop("predictions")
     result = {
         "projector_type": args.projector_type,
         "checkpoint_path": str(Path(args.checkpoint_path)),
         "data_path": str(Path(args.data_path)),
+        "eval_mode": args.eval_mode,
         "metrics": metrics,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
