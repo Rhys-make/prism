@@ -159,3 +159,4 @@ class PrismMultiModalModel(nn.Module):
         else:
             inputs_embeds = text_embeds
         return self.llm(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels, **kwargs)
+
