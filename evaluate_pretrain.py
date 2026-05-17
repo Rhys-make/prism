@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -48,6 +49,7 @@ def parse_args():
     parser.add_argument("--freeze_vision", action="store_true", default=True)
     parser.add_argument("--use_tome", action="store_true", default=True)
     parser.add_argument("--max_eval_samples", type=int, default=0, help="调试用；0 表示评测完整验证集。")
+    parser.add_argument("--retain_ratio_filter", type=float, default=None, help="只评测指定压缩率，例如 0.2。")
     parser.add_argument("--compute_rouge_l", action="store_true", help="开启生成式 ROUGE-L 答案相似度评估。")
     parser.add_argument("--rouge_max_samples", type=int, default=1000, help="ROUGE-L 最多生成多少条；0 表示完整验证集。")
     parser.add_argument("--max_new_tokens", type=int, default=64, help="生成式评估时的最大新 token 数。")
@@ -71,6 +73,32 @@ def _move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[s
         if key in batch:
             model_batch[key] = batch[key].to(device)
     return model_batch
+
+
+def _sync_device(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _filter_batch_by_retain_ratio(batch: Dict[str, Any], retain_ratio_filter: float | None):
+    if retain_ratio_filter is None:
+        return batch
+    if "retain_ratio" not in batch:
+        raise ValueError("--retain_ratio_filter 需要数据集中包含 retain_ratio 字段。")
+
+    retain_ratios = batch["retain_ratio"].float()
+    keep = (retain_ratios - float(retain_ratio_filter)).abs() < 1e-4
+    if not bool(keep.any().item()):
+        return None
+
+    filtered = {}
+    batch_size = int(retain_ratios.shape[0])
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+            filtered[key] = value[keep]
+        else:
+            filtered[key] = value
+    return filtered
 
 
 def _load_projector_checkpoint(model, checkpoint_path: str, expected_projector_type: str):
@@ -119,6 +147,8 @@ def _empty_stats() -> Dict[str, float]:
         "num_samples": 0.0,
         "rouge_l_sum": 0.0,
         "rouge_l_count": 0.0,
+        "cloud_forward_latency_ms_sum": 0.0,
+        "latency_count": 0.0,
     }
 
 
@@ -128,12 +158,16 @@ def _finalize_stats(stats: Dict[str, float]) -> Dict[str, float]:
     eval_loss = stats["loss_sum"] / max(1, total_tokens)
     ppl = math.exp(eval_loss) if eval_loss < 50 else float("inf")
     token_accuracy = correct_tokens / max(1, total_tokens)
+    latency_count = max(1.0, stats["latency_count"])
+    cloud_forward_latency_ms = stats["cloud_forward_latency_ms_sum"] / latency_count
     return {
         "eval_loss": float(eval_loss),
         "ppl": float(ppl),
         "token_accuracy": float(token_accuracy),
         "rouge_l": float(stats["rouge_l_sum"] / stats["rouge_l_count"]) if stats["rouge_l_count"] > 0 else None,
         "rouge_l_count": int(stats["rouge_l_count"]),
+        "cloud_forward_latency_ms": float(cloud_forward_latency_ms),
+        "samples_per_second": float(1000.0 / cloud_forward_latency_ms) if cloud_forward_latency_ms > 0 else None,
         "correct_tokens": correct_tokens,
         "total_tokens": total_tokens,
         "num_samples": int(stats["num_samples"]),
@@ -331,6 +365,7 @@ def evaluate(
     compute_rouge_l: bool = False,
     rouge_max_samples: int = 1000,
     max_new_tokens: int = 64,
+    retain_ratio_filter: float | None = None,
 ) -> Dict[str, Any]:
     model.eval()
     overall = _empty_stats()
@@ -340,6 +375,11 @@ def evaluate(
 
     progress = tqdm(total=len(dataloader), desc="Eval pretrain", dynamic_ncols=True)
     for batch in dataloader:
+        batch = _filter_batch_by_retain_ratio(batch, retain_ratio_filter)
+        if batch is None:
+            progress.update(1)
+            continue
+
         batch_size = int(batch["input_ids"].shape[0])
         if max_eval_samples > 0 and seen_samples >= max_eval_samples:
             break
@@ -352,7 +392,12 @@ def evaluate(
             batch_size = keep
 
         model_batch = _move_batch_to_device(batch, device)
+        _sync_device(device)
+        forward_start = time.perf_counter()
         out = model(**model_batch)
+        _sync_device(device)
+        cloud_forward_latency_ms = (time.perf_counter() - forward_start) * 1000
+        per_sample_forward_latency_ms = cloud_forward_latency_ms / max(1, batch_size)
 
         text_labels = model_batch["labels"]
         image_len = out.logits.shape[1] - text_labels.shape[1]
@@ -388,6 +433,8 @@ def evaluate(
         overall["correct_tokens"] += correct
         overall["total_tokens"] += total
         overall["num_samples"] += batch_size
+        overall["cloud_forward_latency_ms_sum"] += per_sample_forward_latency_ms * batch_size
+        overall["latency_count"] += batch_size
 
         if "retain_ratio" in batch:
             retain_ratios = batch["retain_ratio"].detach().cpu().tolist()
@@ -399,6 +446,8 @@ def evaluate(
                 stats["correct_tokens"] += int(correct_mask[i].sum().item())
                 stats["total_tokens"] += int(row_mask.sum().item())
                 stats["num_samples"] += 1
+                stats["cloud_forward_latency_ms_sum"] += per_sample_forward_latency_ms
+                stats["latency_count"] += 1
 
         if compute_rouge_l and (rouge_max_samples <= 0 or rouge_seen < rouge_max_samples):
             for i in range(batch_size):
@@ -477,6 +526,7 @@ def main():
         compute_rouge_l=args.compute_rouge_l,
         rouge_max_samples=args.rouge_max_samples,
         max_new_tokens=args.max_new_tokens,
+        retain_ratio_filter=args.retain_ratio_filter,
     )
     result = {
         "projector_type": args.projector_type,
@@ -484,6 +534,7 @@ def main():
         "data_path": str(Path(args.data_path)),
         "split_mode": args.split_mode,
         "test_ratio": float(split_ratio),
+        "retain_ratio_filter": args.retain_ratio_filter,
         "seed": int(args.seed),
         "metrics": metrics,
     }
