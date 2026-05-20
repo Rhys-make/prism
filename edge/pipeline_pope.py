@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total_tokens", type=int, default=576)
     parser.add_argument("--max_drop", type=int, default=450)
     parser.add_argument(
+        "--vision_feature_layer",
+        type=int,
+        default=-2,
+        help="CLIP hidden-state layer to save. LLaVA-1.5 uses -2 before the projector.",
+    )
+    parser.add_argument(
         "--feature_storage",
         type=str,
         default="int8",
@@ -208,7 +214,25 @@ def build_sparse_source_payload(model, actual_keep_tokens: int) -> Dict[str, obj
     }
 
 
-def infer_compressed_features(model, image_processor, dtype, device: str, image_path: str, retain_ratio: float, allocator: CNA_Allocator):
+def select_vision_features(outputs, feature_layer: int) -> torch.Tensor:
+    """Select the CLIP feature layer that will be sent to the cloud projector."""
+    hidden_states = getattr(outputs, "hidden_states", None)
+    if hidden_states is None:
+        raise ValueError("CLIP outputs do not include hidden_states. Call the model with output_hidden_states=True.")
+    hidden = hidden_states[int(feature_layer)]
+    return hidden[:, 1:, :].contiguous()
+
+
+def infer_compressed_features(
+    model,
+    image_processor,
+    dtype,
+    device: str,
+    image_path: str,
+    retain_ratio: float,
+    allocator: CNA_Allocator,
+    vision_feature_layer: int,
+):
     img = Image.open(image_path).convert("RGB")
     inputs = image_processor(images=img, return_tensors="pt")
     pixel_values = inputs.pixel_values.to(device=device, dtype=dtype)
@@ -222,13 +246,12 @@ def infer_compressed_features(model, image_processor, dtype, device: str, image_
     model.r = r_list
 
     with torch.no_grad():
-        _ = model(pixel_values)
+        _ = model(pixel_values, output_hidden_states=True)
         start_time = time.perf_counter()
-        outputs = model(pixel_values)
+        outputs = model(pixel_values, output_hidden_states=True)
         inference_ms = (time.perf_counter() - start_time) * 1000
 
-    hidden = outputs.last_hidden_state
-    compressed = hidden[:, 1:, :].contiguous().squeeze(0).cpu()
+    compressed = select_vision_features(outputs, vision_feature_layer).squeeze(0).cpu()
     actual_keep_tokens = int(compressed.shape[0])
     actual_drop_tokens = int(total_tokens - actual_keep_tokens)
     source_payload = build_sparse_source_payload(model, actual_keep_tokens)
@@ -381,6 +404,8 @@ def main():
         "total_tokens": args.total_tokens,
         "max_drop": args.max_drop,
         "dataset": "pope",
+        "vision_feature_layer": args.vision_feature_layer,
+        "vision_feature_select_strategy": "default",
         "feature_storage": args.feature_storage,
         "output_format": args.output_format,
         "source_tracing": not args.no_source,
@@ -448,6 +473,7 @@ def main():
                 image_path=image_path,
                 retain_ratio=retain_ratio,
                 allocator=allocator,
+                vision_feature_layer=args.vision_feature_layer,
             )
         except Exception as e:
             print(f"[Skip] Failed processing image: {image_path} ({e})")
@@ -479,6 +505,8 @@ def main():
             "r_list": r_list,
             "compressed_token_count": int(compressed_features.shape[0]),
             "compressed_feature_storage": feature_payload["compressed_feature_storage"],
+            "vision_feature_layer": args.vision_feature_layer,
+            "vision_feature_select_strategy": "default",
             "conversations": sample.get("conversations", []),
             "inference_ms": inference_ms,
             "pope_sample": {
@@ -495,6 +523,7 @@ def main():
         manifest_record = {
             "sample_id": idx,
             "image_id": payload["image_id"],
+            "image_path": payload["image_path"],
             "retain_ratio": retain_ratio,
             "target_keep_tokens": target_keep_tokens,
             "drop_tokens": drop_tokens,
@@ -503,6 +532,8 @@ def main():
             "actual_retain_ratio": actual_keep_tokens / float(args.total_tokens),
             "compressed_token_count": int(compressed_features.shape[0]),
             "compressed_feature_storage": payload["compressed_feature_storage"],
+            "vision_feature_layer": args.vision_feature_layer,
+            "vision_feature_select_strategy": "default",
             "inference_ms": inference_ms,
             "conversations": payload["conversations"],
             "pope_sample": payload["pope_sample"],
