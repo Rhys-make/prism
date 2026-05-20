@@ -2,36 +2,54 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
 from transformers import AutoProcessor, AutoTokenizer, CLIPImageProcessor, LlavaForConditionalGeneration
 
-from edge.cna import CNA_Allocator
-from edge.tome.patch.clip import apply_patch_clip
 
-
-DEFAULT_RETAIN_RATIOS = [1.0, 0.8, 0.6, 0.4, 0.2]
+DEFAULT_BUDGET_SPECS = [
+    "0.8:472986",
+    "0.6:354996",
+    "0.4:235980",
+    "0.2:117990",
+]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate native LLaVA-1.5 on POPE with and without ToMe vision-token compression. "
-            "The cloud side uses LLaVA's original projector and LLM; no trained prism projector is loaded."
+            "Evaluate native LLaVA-1.5 on POPE with compressed-image transmission baselines. "
+            "The edge side JPEG/WebP-encodes the image under a byte budget; the cloud side decodes "
+            "the image and runs the original LLaVA vision tower, projector, and LLM."
         )
     )
     parser.add_argument("--model_name_or_path", type=str, required=True, help="LLaVA-1.5 HF model path.")
     parser.add_argument("--data_path", type=str, required=True, help="POPE annotation JSON/JSONL path.")
     parser.add_argument("--image_folder", type=str, required=True, help="Folder containing POPE images.")
-    parser.add_argument("--retain_ratios", type=float, nargs="+", default=DEFAULT_RETAIN_RATIOS)
-    parser.add_argument("--output_path", type=str, default="outputs/llava15_pope_tome_eval.json")
+    parser.add_argument(
+        "--codecs",
+        type=str,
+        nargs="+",
+        default=["jpeg", "webp"],
+        choices=["jpeg", "webp"],
+        help="Compressed image codecs to evaluate.",
+    )
+    parser.add_argument(
+        "--budget_specs",
+        type=str,
+        nargs="+",
+        default=DEFAULT_BUDGET_SPECS,
+        help="Budget specs in label:bytes format, e.g. 0.6:354996.",
+    )
+    parser.add_argument("--include_raw", action="store_true", help="Also evaluate original image files.")
+    parser.add_argument("--output_path", type=str, default="outputs/llava15_image_compression/pope_eval.json")
     parser.add_argument("--save_predictions", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
@@ -43,9 +61,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--local_files_only", action="store_true")
     parser.add_argument("--max_samples", type=int, default=0, help="Debug only; 0 means all samples.")
-    parser.add_argument("--num_layers", type=int, default=24)
-    parser.add_argument("--total_tokens", type=int, default=576)
-    parser.add_argument("--max_drop", type=int, default=575)
     parser.add_argument(
         "--question_suffix",
         type=str,
@@ -58,7 +73,18 @@ def parse_args() -> argparse.Namespace:
         default=" ",
         help="Prefix used when scoring candidate answers. A leading space matches LLaMA tokenization better.",
     )
-    parser.add_argument("--warmup", type=int, default=1, help="Warmup forwards per retain ratio.")
+    parser.add_argument("--warmup", type=int, default=1, help="Warmup forwards before measured evaluation.")
+    parser.add_argument("--jpeg_min_quality", type=int, default=1)
+    parser.add_argument("--jpeg_max_quality", type=int, default=95)
+    parser.add_argument("--webp_min_quality", type=int, default=1)
+    parser.add_argument("--webp_max_quality", type=int, default=95)
+    parser.add_argument(
+        "--network_mbps",
+        type=float,
+        nargs="+",
+        default=[5.0, 10.0, 50.0, 100.0],
+        help="Bandwidth values used to estimate network and end-to-end latency.",
+    )
     return parser.parse_args()
 
 
@@ -78,12 +104,6 @@ def _sync_device(device: torch.device):
 
 
 def load_llava_processor(model_name_or_path: str, local_files_only: bool):
-    """Load the LLaVA processor, falling back to the slow LLaMA tokenizer.
-
-    Some server environments ship an older `tokenizers` wheel that cannot parse
-    newer tokenizer.json files. The slow tokenizer path avoids that fast-tokenizer
-    parser while keeping the image processor identical.
-    """
     try:
         return AutoProcessor.from_pretrained(
             model_name_or_path,
@@ -102,6 +122,22 @@ def load_llava_processor(model_name_or_path: str, local_files_only: bool):
             local_files_only=local_files_only,
         )
         return SimpleNamespace(tokenizer=tokenizer, image_processor=image_processor)
+
+
+def parse_budget_specs(specs: List[str]) -> List[Tuple[str, int]]:
+    budgets: List[Tuple[str, int]] = []
+    for spec in specs:
+        if ":" not in spec:
+            raise ValueError(f"Budget spec must be label:bytes, got {spec!r}")
+        label, value = spec.split(":", 1)
+        label = label.strip()
+        budget = int(value.strip())
+        if not label:
+            raise ValueError(f"Budget label is empty in {spec!r}")
+        if budget <= 0:
+            raise ValueError(f"Budget must be positive in {spec!r}")
+        budgets.append((label, budget))
+    return budgets
 
 
 def load_pope_dataset(data_path: str) -> List[Dict[str, Any]]:
@@ -171,38 +207,6 @@ def normalize_label(sample: Dict[str, Any]) -> str:
     raise ValueError(f"POPE label must be yes/no, got: {label!r}")
 
 
-def build_exact_r_list(drop_tokens: int, allocator: CNA_Allocator) -> List[int]:
-    drop_tokens = int(max(0, min(drop_tokens, allocator.total_tokens - 1)))
-    if drop_tokens == 0:
-        return [0] * allocator.num_layers
-
-    weights = [float(w) for w in allocator.weights]
-    raw = [drop_tokens * w for w in weights]
-    r_list = [int(math.floor(v)) for v in raw]
-    remainder = drop_tokens - sum(r_list)
-
-    if remainder > 0:
-        order = sorted(range(len(raw)), key=lambda i: raw[i] - r_list[i], reverse=True)
-        for i in order[:remainder]:
-            r_list[i] += 1
-    return r_list
-
-
-def set_vision_retain_ratio(vision_tower, retain_ratio: float, allocator: CNA_Allocator) -> Dict[str, Any]:
-    retain_ratio = float(retain_ratio)
-    target_keep_tokens = int(round(allocator.total_tokens * retain_ratio))
-    target_keep_tokens = max(1, min(allocator.total_tokens, target_keep_tokens))
-    drop_tokens = allocator.total_tokens - target_keep_tokens
-    r_list = build_exact_r_list(drop_tokens, allocator)
-    if hasattr(vision_tower, "r"):
-        vision_tower.r = r_list
-    return {
-        "target_keep_tokens": target_keep_tokens,
-        "target_drop_tokens": drop_tokens,
-        "r_list": r_list,
-    }
-
-
 def get_vision_tower(model):
     if hasattr(model, "vision_tower"):
         return model.vision_tower
@@ -247,20 +251,107 @@ def _select_vision_features(model, vision_outputs):
     return selected
 
 
+def encode_jpeg(image: Image.Image, quality: int) -> bytes:
+    buf = BytesIO()
+    image.save(buf, format="JPEG", quality=int(quality), optimize=True)
+    return buf.getvalue()
+
+
+def encode_webp(image: Image.Image, quality: int) -> bytes:
+    buf = BytesIO()
+    image.save(buf, format="WEBP", quality=int(quality), method=6)
+    return buf.getvalue()
+
+
+def encode_image_at_quality(image: Image.Image, codec: str, quality: int) -> bytes:
+    if codec == "jpeg":
+        return encode_jpeg(image, quality)
+    if codec == "webp":
+        return encode_webp(image, quality)
+    raise ValueError(f"Unsupported codec: {codec}")
+
+
+def compress_to_budget(
+    image: Image.Image,
+    codec: str,
+    target_bytes: int,
+    min_quality: int,
+    max_quality: int,
+) -> Dict[str, Any]:
+    """Return highest-quality compressed bytes not exceeding target when possible."""
+    image = image.convert("RGB")
+    low = int(min_quality)
+    high = int(max_quality)
+    if low > high:
+        raise ValueError(f"min_quality={low} must be <= max_quality={high}")
+
+    start = time.perf_counter()
+    min_bytes = encode_image_at_quality(image, codec, low)
+    if len(min_bytes) > target_bytes:
+        return {
+            "encoded_bytes": min_bytes,
+            "quality": low,
+            "edge_encode_latency_ms": (time.perf_counter() - start) * 1000,
+            "over_budget": True,
+        }
+
+    max_bytes = encode_image_at_quality(image, codec, high)
+    if len(max_bytes) <= target_bytes:
+        return {
+            "encoded_bytes": max_bytes,
+            "quality": high,
+            "edge_encode_latency_ms": (time.perf_counter() - start) * 1000,
+            "over_budget": False,
+        }
+
+    best_quality = low
+    best_bytes = min_bytes
+    left, right = low, high
+    while left <= right:
+        mid = (left + right) // 2
+        candidate = encode_image_at_quality(image, codec, mid)
+        if len(candidate) <= target_bytes:
+            best_quality = mid
+            best_bytes = candidate
+            left = mid + 1
+        else:
+            right = mid - 1
+
+    return {
+        "encoded_bytes": best_bytes,
+        "quality": best_quality,
+        "edge_encode_latency_ms": (time.perf_counter() - start) * 1000,
+        "over_budget": False,
+    }
+
+
+def load_raw_image_bytes(image_path: str) -> Dict[str, Any]:
+    start = time.perf_counter()
+    data = Path(image_path).read_bytes()
+    return {
+        "encoded_bytes": data,
+        "quality": None,
+        "edge_encode_latency_ms": (time.perf_counter() - start) * 1000,
+        "over_budget": False,
+    }
+
+
+def decode_image_bytes(encoded_bytes: bytes) -> Tuple[Image.Image, float]:
+    start = time.perf_counter()
+    with Image.open(BytesIO(encoded_bytes)) as image:
+        decoded = image.convert("RGB")
+    return decoded, (time.perf_counter() - start) * 1000
+
+
 @torch.no_grad()
-def build_image_embeds(
+def build_image_embeds_from_image(
     model,
     processor,
-    image_path: str,
-    retain_ratio: float,
-    allocator: CNA_Allocator,
+    image: Image.Image,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Dict[str, Any]:
     vision_tower = get_vision_tower(model)
-    tome_info = set_vision_retain_ratio(vision_tower, retain_ratio, allocator)
-
-    image = Image.open(image_path).convert("RGB")
     pixel_values = processor.image_processor(images=image, return_tensors="pt").pixel_values
     pixel_values = pixel_values.to(device=device, dtype=dtype)
 
@@ -271,7 +362,7 @@ def build_image_embeds(
     vision_latency_ms = (time.perf_counter() - vision_start) * 1000
 
     selected = _select_vision_features(model, vision_outputs)
-    actual_keep_tokens = int(selected.shape[1])
+    actual_tokens = int(selected.shape[1])
 
     _sync_device(device)
     projector_start = time.perf_counter()
@@ -279,19 +370,11 @@ def build_image_embeds(
     _sync_device(device)
     projector_latency_ms = (time.perf_counter() - projector_start) * 1000
 
-    hidden_size = int(selected.shape[-1])
-    bytes_fp16 = actual_keep_tokens * hidden_size * 2
-    bytes_int8 = actual_keep_tokens * hidden_size + actual_keep_tokens * 2
-
     return {
         "image_embeds": image_embeds,
-        "actual_keep_tokens": actual_keep_tokens,
-        "target_keep_tokens": int(tome_info["target_keep_tokens"]),
-        "target_drop_tokens": int(tome_info["target_drop_tokens"]),
+        "actual_tokens": actual_tokens,
         "vision_latency_ms": vision_latency_ms,
         "projector_latency_ms": projector_latency_ms,
-        "feature_bytes_fp16": bytes_fp16,
-        "feature_bytes_int8": bytes_int8,
     }
 
 
@@ -390,14 +473,18 @@ def empty_stats() -> Dict[str, float]:
         "fn": 0.0,
         "total": 0.0,
         "yes_predictions": 0.0,
-        "target_keep_tokens_sum": 0.0,
-        "actual_keep_tokens_sum": 0.0,
-        "feature_bytes_fp16_sum": 0.0,
-        "feature_bytes_int8_sum": 0.0,
+        "transmitted_bytes_sum": 0.0,
+        "quality_sum": 0.0,
+        "quality_count": 0.0,
+        "over_budget": 0.0,
+        "actual_tokens_sum": 0.0,
+        "edge_encode_latency_ms_sum": 0.0,
+        "cloud_decode_latency_ms_sum": 0.0,
         "vision_latency_ms_sum": 0.0,
         "projector_latency_ms_sum": 0.0,
         "scoring_latency_ms_sum": 0.0,
-        "total_latency_ms_sum": 0.0,
+        "cloud_latency_ms_sum": 0.0,
+        "compute_latency_ms_sum": 0.0,
         "confidence_sum": 0.0,
     }
 
@@ -406,14 +493,19 @@ def update_stats(stats: Dict[str, float], label: str, result: Dict[str, Any]):
     prediction = result["prediction"]
     stats["total"] += 1
     stats["yes_predictions"] += 1 if prediction == "yes" else 0
-    stats["target_keep_tokens_sum"] += float(result["target_keep_tokens"])
-    stats["actual_keep_tokens_sum"] += float(result["actual_keep_tokens"])
-    stats["feature_bytes_fp16_sum"] += float(result["feature_bytes_fp16"])
-    stats["feature_bytes_int8_sum"] += float(result["feature_bytes_int8"])
+    stats["transmitted_bytes_sum"] += float(result["transmitted_bytes"])
+    stats["over_budget"] += 1 if result.get("over_budget") else 0
+    if result.get("quality") is not None:
+        stats["quality_sum"] += float(result["quality"])
+        stats["quality_count"] += 1
+    stats["actual_tokens_sum"] += float(result["actual_tokens"])
+    stats["edge_encode_latency_ms_sum"] += float(result["edge_encode_latency_ms"])
+    stats["cloud_decode_latency_ms_sum"] += float(result["cloud_decode_latency_ms"])
     stats["vision_latency_ms_sum"] += float(result["vision_latency_ms"])
     stats["projector_latency_ms_sum"] += float(result["projector_latency_ms"])
     stats["scoring_latency_ms_sum"] += float(result["scoring_latency_ms"])
-    stats["total_latency_ms_sum"] += float(result["total_latency_ms"])
+    stats["cloud_latency_ms_sum"] += float(result["cloud_latency_ms"])
+    stats["compute_latency_ms_sum"] += float(result["compute_latency_ms"])
     stats["confidence_sum"] += float(result["confidence"])
 
     if label == "yes" and prediction == "yes":
@@ -426,37 +518,47 @@ def update_stats(stats: Dict[str, float], label: str, result: Dict[str, Any]):
         stats["fn"] += 1
 
 
-def finalize_stats(stats: Dict[str, float], total_tokens: int) -> Dict[str, float]:
+def finalize_stats(stats: Dict[str, float], network_mbps: List[float]) -> Dict[str, Any]:
     tp, tn, fp, fn = stats["tp"], stats["tn"], stats["fp"], stats["fn"]
     total = max(1.0, stats["total"])
     accuracy = (tp + tn) / total
     precision = tp / max(1.0, tp + fp)
     recall = tp / max(1.0, tp + fn)
     f1 = 2 * precision * recall / max(1e-12, precision + recall)
-    specificity = tn / max(1.0, tn + fp)
-    fpr = fp / max(1.0, fp + tn)
-    fnr = fn / max(1.0, fn + tp)
+
+    avg_bytes = stats["transmitted_bytes_sum"] / total
+    compute_latency_ms = stats["compute_latency_ms_sum"] / total
+    network_estimates = {}
+    for mbps in network_mbps:
+        network_ms = avg_bytes * 8.0 / (float(mbps) * 1_000_000.0) * 1000.0
+        key = f"{float(mbps):g}mbps"
+        network_estimates[key] = {
+            "network_latency_ms": network_ms,
+            "estimated_end_to_end_latency_ms": compute_latency_ms + network_ms,
+        }
 
     return {
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "false_positive_rate": fpr,
-        "false_negative_rate": fnr,
-        "specificity": specificity,
-        "yes_ratio": stats["yes_predictions"] / total,
-        "avg_target_keep_tokens": stats["target_keep_tokens_sum"] / total,
-        "avg_actual_keep_tokens": stats["actual_keep_tokens_sum"] / total,
-        "avg_actual_retain_ratio": stats["actual_keep_tokens_sum"] / total / total_tokens,
-        "avg_feature_bytes_fp16": stats["feature_bytes_fp16_sum"] / total,
-        "avg_feature_bytes_int8": stats["feature_bytes_int8_sum"] / total,
-        "vision_latency_ms": stats["vision_latency_ms_sum"] / total,
-        "projector_latency_ms": stats["projector_latency_ms_sum"] / total,
-        "scoring_latency_ms": stats["scoring_latency_ms_sum"] / total,
-        "total_latency_ms": stats["total_latency_ms_sum"] / total,
-        "avg_confidence": stats["confidence_sum"] / total,
-        "samples_per_second": 1000.0 / max(1e-12, stats["total_latency_ms_sum"] / total),
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "false_positive_rate": float(fp / max(1.0, fp + tn)),
+        "false_negative_rate": float(fn / max(1.0, fn + tp)),
+        "specificity": float(tn / max(1.0, tn + fp)),
+        "yes_ratio": float(stats["yes_predictions"] / total),
+        "avg_transmitted_bytes": float(avg_bytes),
+        "avg_quality": float(stats["quality_sum"] / stats["quality_count"]) if stats["quality_count"] > 0 else None,
+        "over_budget_ratio": float(stats["over_budget"] / total),
+        "avg_actual_tokens": float(stats["actual_tokens_sum"] / total),
+        "edge_encode_latency_ms": float(stats["edge_encode_latency_ms_sum"] / total),
+        "cloud_decode_latency_ms": float(stats["cloud_decode_latency_ms_sum"] / total),
+        "vision_latency_ms": float(stats["vision_latency_ms_sum"] / total),
+        "projector_latency_ms": float(stats["projector_latency_ms_sum"] / total),
+        "scoring_latency_ms": float(stats["scoring_latency_ms_sum"] / total),
+        "cloud_latency_ms": float(stats["cloud_latency_ms_sum"] / total),
+        "compute_latency_ms": float(compute_latency_ms),
+        "avg_confidence": float(stats["confidence_sum"] / total),
+        "network_estimates": network_estimates,
         "tp": int(tp),
         "tn": int(tn),
         "fp": int(fp),
@@ -465,65 +567,114 @@ def finalize_stats(stats: Dict[str, float], total_tokens: int) -> Dict[str, floa
     }
 
 
-def evaluate_ratio(
+@torch.no_grad()
+def evaluate_encoded_image(
+    model,
+    processor,
+    image_payload: Dict[str, Any],
+    prompt: str,
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Dict[str, Any]:
+    _sync_device(device)
+    cloud_start = time.perf_counter()
+    decoded_image, decode_latency_ms = decode_image_bytes(image_payload["encoded_bytes"])
+    image_result = build_image_embeds_from_image(model, processor, decoded_image, device, dtype)
+    prefix_embeds, prefix_attention_mask = build_prefix_embeds(
+        model=model,
+        tokenizer=processor.tokenizer,
+        prompt=prompt,
+        image_embeds=image_result["image_embeds"],
+        device=device,
+    )
+    score_result = score_yes_no(
+        model=model,
+        tokenizer=processor.tokenizer,
+        prefix_embeds=prefix_embeds,
+        prefix_attention_mask=prefix_attention_mask,
+        candidate_prefix=args.candidate_prefix,
+        device=device,
+    )
+    _sync_device(device)
+    cloud_latency_ms = (time.perf_counter() - cloud_start) * 1000
+
+    return {
+        "prediction": score_result["prediction"],
+        "yes_score": score_result["yes_score"],
+        "no_score": score_result["no_score"],
+        "confidence": score_result["confidence"],
+        "transmitted_bytes": len(image_payload["encoded_bytes"]),
+        "quality": image_payload.get("quality"),
+        "over_budget": bool(image_payload.get("over_budget", False)),
+        "actual_tokens": image_result["actual_tokens"],
+        "edge_encode_latency_ms": float(image_payload["edge_encode_latency_ms"]),
+        "cloud_decode_latency_ms": decode_latency_ms,
+        "vision_latency_ms": image_result["vision_latency_ms"],
+        "projector_latency_ms": image_result["projector_latency_ms"],
+        "scoring_latency_ms": score_result["scoring_latency_ms"],
+        "cloud_latency_ms": cloud_latency_ms,
+        "compute_latency_ms": float(image_payload["edge_encode_latency_ms"]) + cloud_latency_ms,
+    }
+
+
+def make_image_payload(
+    image_path: str,
+    codec: str,
+    budget_bytes: Optional[int],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    if codec == "raw":
+        return load_raw_image_bytes(image_path)
+
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        if codec == "jpeg":
+            return compress_to_budget(
+                image=image,
+                codec=codec,
+                target_bytes=int(budget_bytes),
+                min_quality=args.jpeg_min_quality,
+                max_quality=args.jpeg_max_quality,
+            )
+        if codec == "webp":
+            return compress_to_budget(
+                image=image,
+                codec=codec,
+                target_bytes=int(budget_bytes),
+                min_quality=args.webp_min_quality,
+                max_quality=args.webp_max_quality,
+            )
+    raise ValueError(f"Unsupported codec: {codec}")
+
+
+def evaluate_setting(
     model,
     processor,
     samples: List[Dict[str, Any]],
     args: argparse.Namespace,
-    retain_ratio: float,
-    allocator: CNA_Allocator,
+    setting_name: str,
+    codec: str,
+    budget_label: Optional[str],
+    budget_bytes: Optional[int],
     device: torch.device,
     dtype: torch.dtype,
     pred_fh,
 ) -> Dict[str, Any]:
     stats = empty_stats()
-    tokenizer = processor.tokenizer
-    desc = f"POPE retain={retain_ratio:.2f}"
-
     iterator = samples
     if args.max_samples and args.max_samples > 0:
         iterator = samples[: args.max_samples]
 
+    desc = setting_name
     for index, sample in enumerate(tqdm(iterator, desc=desc)):
         question = normalize_question(sample, args.question_suffix)
         label = normalize_label(sample)
         image_path = resolve_image_path(args.image_folder, sample)
         prompt = build_prompt(question)
 
-        _sync_device(device)
-        total_start = time.perf_counter()
-        image_result = build_image_embeds(
-            model=model,
-            processor=processor,
-            image_path=image_path,
-            retain_ratio=retain_ratio,
-            allocator=allocator,
-            device=device,
-            dtype=dtype,
-        )
-        prefix_embeds, prefix_attention_mask = build_prefix_embeds(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            image_embeds=image_result["image_embeds"],
-            device=device,
-        )
-        score_result = score_yes_no(
-            model=model,
-            tokenizer=tokenizer,
-            prefix_embeds=prefix_embeds,
-            prefix_attention_mask=prefix_attention_mask,
-            candidate_prefix=args.candidate_prefix,
-            device=device,
-        )
-        _sync_device(device)
-        total_latency_ms = (time.perf_counter() - total_start) * 1000
-
-        result = {
-            **{k: v for k, v in image_result.items() if k != "image_embeds"},
-            **score_result,
-            "total_latency_ms": total_latency_ms,
-        }
+        image_payload = make_image_payload(image_path, codec, budget_bytes, args)
+        result = evaluate_encoded_image(model, processor, image_payload, prompt, args, device, dtype)
         update_stats(stats, label, result)
 
         if pred_fh is not None:
@@ -531,7 +682,10 @@ def evaluate_ratio(
                 json.dumps(
                     {
                         "index": index,
-                        "retain_ratio": retain_ratio,
+                        "setting": setting_name,
+                        "codec": codec,
+                        "budget_label": budget_label,
+                        "budget_bytes": budget_bytes,
                         "image": sample.get("image") or sample.get("image_path") or sample.get("file_name"),
                         "question": question,
                         "label": label,
@@ -539,38 +693,39 @@ def evaluate_ratio(
                         "yes_score": result["yes_score"],
                         "no_score": result["no_score"],
                         "confidence": result["confidence"],
-                        "actual_keep_tokens": result["actual_keep_tokens"],
-                        "feature_bytes_int8": result["feature_bytes_int8"],
-                        "feature_bytes_fp16": result["feature_bytes_fp16"],
+                        "transmitted_bytes": result["transmitted_bytes"],
+                        "quality": result["quality"],
+                        "over_budget": result["over_budget"],
                     },
                     ensure_ascii=False,
                 )
                 + "\n"
             )
 
-    return finalize_stats(stats, args.total_tokens)
+    metrics = finalize_stats(stats, args.network_mbps)
+    metrics["codec"] = codec
+    metrics["budget_label"] = budget_label
+    metrics["target_budget_bytes"] = budget_bytes
+    return metrics
 
 
-def warmup_model(model, processor, samples, args, retain_ratio, allocator, device, dtype):
+def warmup_model(model, processor, samples, args, device, dtype):
     if args.warmup <= 0 or len(samples) == 0:
         return
-    tokenizer = processor.tokenizer
     sample = samples[0]
     question = normalize_question(sample, args.question_suffix)
     image_path = resolve_image_path(args.image_folder, sample)
     prompt = build_prompt(question)
+    image_payload = load_raw_image_bytes(image_path)
     for _ in range(args.warmup):
-        image_result = build_image_embeds(model, processor, image_path, retain_ratio, allocator, device, dtype)
-        prefix_embeds, prefix_attention_mask = build_prefix_embeds(
-            model, tokenizer, prompt, image_result["image_embeds"], device
-        )
-        _ = score_yes_no(model, tokenizer, prefix_embeds, prefix_attention_mask, args.candidate_prefix, device)
+        _ = evaluate_encoded_image(model, processor, image_payload, prompt, args, device, dtype)
 
 
 def main():
     args = parse_args()
     device = torch.device(args.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
     dtype = _dtype_from_name(args.dtype)
+    budgets = parse_budget_specs(args.budget_specs)
 
     samples = load_pope_dataset(args.data_path)
     if args.max_samples and args.max_samples > 0:
@@ -588,40 +743,49 @@ def main():
     if processor.tokenizer.pad_token_id is None and processor.tokenizer.eos_token_id is not None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-    allocator = CNA_Allocator(
-        num_layers=args.num_layers,
-        total_tokens=args.total_tokens,
-        max_drop=args.max_drop,
-    )
-
-    ratios = [float(r) for r in args.retain_ratios]
-    exact_baseline_ratios = [r for r in ratios if r >= 0.999]
-    compressed_ratios = [r for r in ratios if r < 0.999]
-
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
     pred_fh = None
     if args.save_predictions:
         pred_path = Path(args.save_predictions)
         pred_path.parent.mkdir(parents=True, exist_ok=True)
         pred_fh = open(pred_path, "w", encoding="utf-8")
 
+    warmup_model(model, processor, samples, args, device, dtype)
+
     results: Dict[str, Any] = {}
     try:
-        for ratio in exact_baseline_ratios:
-            print(f"[INFO] evaluating exact no-compression baseline retain={ratio:.2f} before applying ToMe patch")
-            warmup_model(model, processor, samples, args, ratio, allocator, device, dtype)
-            results[f"{ratio:.2f}"] = evaluate_ratio(
-                model, processor, samples, args, ratio, allocator, device, dtype, pred_fh
+        if args.include_raw:
+            results["raw"] = evaluate_setting(
+                model=model,
+                processor=processor,
+                samples=samples,
+                args=args,
+                setting_name="raw",
+                codec="raw",
+                budget_label=None,
+                budget_bytes=None,
+                device=device,
+                dtype=dtype,
+                pred_fh=pred_fh,
             )
 
-        if compressed_ratios:
-            print("[INFO] applying ToMe patch to LLaVA vision tower")
-            apply_patch_clip(get_vision_tower(model), trace_source=False)
-            for ratio in compressed_ratios:
-                warmup_model(model, processor, samples, args, ratio, allocator, device, dtype)
-                results[f"{ratio:.2f}"] = evaluate_ratio(
-                    model, processor, samples, args, ratio, allocator, device, dtype, pred_fh
+        for codec in args.codecs:
+            for budget_label, budget_bytes in budgets:
+                setting_name = f"{codec}_{budget_label}"
+                results[setting_name] = evaluate_setting(
+                    model=model,
+                    processor=processor,
+                    samples=samples,
+                    args=args,
+                    setting_name=setting_name,
+                    codec=codec,
+                    budget_label=budget_label,
+                    budget_bytes=budget_bytes,
+                    device=device,
+                    dtype=dtype,
+                    pred_fh=pred_fh,
                 )
     finally:
         if pred_fh is not None:
@@ -632,8 +796,11 @@ def main():
         "data_path": args.data_path,
         "image_folder": args.image_folder,
         "eval_mode": "yes_no_likelihood",
-        "retain_ratios": ratios,
-        "metrics_by_retain_ratio": results,
+        "budget_specs": [{"label": label, "bytes": budget} for label, budget in budgets],
+        "codecs": args.codecs,
+        "include_raw": args.include_raw,
+        "network_mbps": args.network_mbps,
+        "metrics_by_setting": results,
     }
 
     with open(output_path, "w", encoding="utf-8") as f:
