@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, CLIPImageProcessor, LlavaForConditionalGeneration, get_cosine_schedule_with_warmup
 
@@ -259,6 +259,7 @@ class SGCSRCompressedDataset(Dataset):
         tokenizer,
         max_samples: int = 0,
         allow_missing_source: bool = False,
+        seed: int = 42,
     ):
         self.image_folder = image_folder
         self.tokenizer = tokenizer
@@ -279,13 +280,55 @@ class SGCSRCompressedDataset(Dataset):
         else:
             raise ValueError(f"Invalid compressed data path: {data_path}")
 
-        if max_samples and max_samples > 0:
-            self.items = self.items[:max_samples]
         if not self.items:
             raise ValueError(f"No compressed samples found under {data_path}")
+        if max_samples and max_samples > 0 and max_samples < len(self.items):
+            self.items = self._balanced_subset_by_retain_ratio(self.items, max_samples, seed)
 
     def __len__(self) -> int:
         return len(self.items)
+
+    @staticmethod
+    def _item_retain_ratio(item: Any) -> float:
+        if isinstance(item, tuple):
+            payload = item[1]
+        else:
+            payload = torch.load(item, map_location="cpu")
+
+        retain_ratio = payload.get("actual_retain_ratio", payload.get("retain_ratio"))
+        if retain_ratio is None:
+            compressed_count = payload.get("compressed_token_count", payload.get("actual_keep_tokens"))
+            if compressed_count is None:
+                raise ValueError("Sample is missing retain_ratio and token-count metadata.")
+            retain_ratio = float(compressed_count) / 576.0
+        return float(retain_ratio)
+
+    @classmethod
+    def _balanced_subset_by_retain_ratio(cls, items: Sequence[Any], max_samples: int, seed: int) -> List[Any]:
+        groups: Dict[str, List[Any]] = {}
+        for item in items:
+            ratio_key = f"{cls._item_retain_ratio(item):.2f}"
+            groups.setdefault(ratio_key, []).append(item)
+
+        generator = torch.Generator().manual_seed(seed)
+        selected: List[Any] = []
+        ratio_keys = sorted(groups.keys(), key=float)
+        base = max_samples // max(1, len(ratio_keys))
+        remainder = max_samples % max(1, len(ratio_keys))
+
+        for i, ratio_key in enumerate(ratio_keys):
+            group = groups[ratio_key]
+            want = base + (1 if i < remainder else 0)
+            if want <= 0:
+                continue
+            order = torch.randperm(len(group), generator=generator).tolist()
+            selected.extend(group[j] for j in order[: min(want, len(group))])
+
+        return selected
+
+    def get_retain_ratio(self, idx: int) -> float:
+        """Read retain ratio metadata without loading the feature tensor when possible."""
+        return self._item_retain_ratio(self.items[idx])
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         item = self.items[idx]
@@ -375,6 +418,55 @@ class SGCSRCollator:
             "retain_ratio": torch.stack([x["retain_ratio"] for x in instances]),
             "image_paths": [x["image_path"] for x in instances],
         }
+
+
+def build_stratified_train_eval_split(
+    dataset: SGCSRCompressedDataset,
+    test_ratio: float,
+    seed: int,
+) -> Tuple[Subset, Optional[Subset], Dict[str, Dict[str, int]]]:
+    """Split each retain-ratio bucket into train/eval.
+
+    This guarantees that 0.2/0.4/0.6/0.8 compression levels are represented in
+    both train and eval with the same ratio, instead of relying on global random
+    split to be balanced by chance.
+    """
+    if not 0 <= test_ratio < 1:
+        raise ValueError(f"test_ratio must be in [0, 1), got {test_ratio}")
+
+    groups: Dict[str, List[int]] = {}
+    for idx in range(len(dataset)):
+        ratio_key = f"{dataset.get_retain_ratio(idx):.2f}"
+        groups.setdefault(ratio_key, []).append(idx)
+
+    generator = torch.Generator().manual_seed(seed)
+    train_indices: List[int] = []
+    eval_indices: List[int] = []
+    summary: Dict[str, Dict[str, int]] = {}
+
+    for ratio_key in sorted(groups.keys(), key=float):
+        indices = groups[ratio_key]
+        order = torch.randperm(len(indices), generator=generator).tolist()
+        shuffled = [indices[i] for i in order]
+
+        if test_ratio > 0 and len(shuffled) > 1:
+            eval_len = max(1, int(len(shuffled) * test_ratio))
+        else:
+            eval_len = 0
+
+        eval_part = shuffled[:eval_len]
+        train_part = shuffled[eval_len:]
+        train_indices.extend(train_part)
+        eval_indices.extend(eval_part)
+        summary[ratio_key] = {
+            "total": len(shuffled),
+            "train": len(train_part),
+            "eval": len(eval_part),
+        }
+
+    train_ds = Subset(dataset, train_indices)
+    eval_ds = Subset(dataset, eval_indices) if eval_indices else None
+    return train_ds, eval_ds, summary
 
 
 def build_teacher_visual_embeddings(
@@ -684,20 +776,15 @@ def main() -> int:
         tokenizer=tokenizer,
         max_samples=args.max_samples,
         allow_missing_source=args.allow_missing_source,
+        seed=args.seed,
     )
-    split_ratio = float(args.test_ratio)
-    if not 0 <= split_ratio < 1:
-        raise ValueError(f"test_ratio must be in [0, 1), got {split_ratio}")
-    eval_len = max(1, int(len(dataset) * split_ratio)) if len(dataset) > 1 and split_ratio > 0 else 0
-    train_len = len(dataset) - eval_len
-    if eval_len > 0 and train_len > 0:
-        train_ds, eval_ds = random_split(
-            dataset,
-            [train_len, eval_len],
-            generator=torch.Generator().manual_seed(args.seed),
-        )
-    else:
-        train_ds, eval_ds = dataset, None
+    train_ds, eval_ds, split_summary = build_stratified_train_eval_split(
+        dataset=dataset,
+        test_ratio=float(args.test_ratio),
+        seed=args.seed,
+    )
+    train_len = len(train_ds)
+    eval_len = len(eval_ds) if eval_ds is not None else 0
 
     collator = SGCSRCollator(pad_token_id=tokenizer.pad_token_id)
     train_loader = DataLoader(
@@ -726,6 +813,8 @@ def main() -> int:
                 **vars(args),
                 "train_samples": train_len,
                 "eval_samples": eval_len,
+                "split_mode": "stratified_by_retain_ratio",
+                "split_summary": split_summary,
                 "hidden_size": hidden_size,
                 "grid_size": list(reconstructor.grid_size),
             },
@@ -746,6 +835,7 @@ def main() -> int:
     train_log_path = os.path.join(args.output_dir, "train_log.jsonl")
     eval_log_path = os.path.join(args.output_dir, "eval_log.jsonl")
     print(f"[SGCSR] train={train_len} eval={eval_len} grid={reconstructor.grid_size} device={device}")
+    print(f"[SGCSR] stratified split: {json.dumps(split_summary, ensure_ascii=False)}")
     print(f"[SGCSR] loss = {args.task_weight}*L_task + {args.rec_weight}*L_rec + {args.logit_weight}*L_logit")
 
     global_step = 0
