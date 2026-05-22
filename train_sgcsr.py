@@ -45,7 +45,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dim_head", type=int, default=128)
     parser.add_argument("--ff_mult", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--local_topk", type=int, default=0, help="0 means full cross-attention.")
+    parser.add_argument(
+        "--local_topk",
+        type=int,
+        default=0,
+        help="Maximum source tokens per query after radius filtering. 0 means no top-k cap.",
+    )
+    parser.add_argument(
+        "--local_radius",
+        type=float,
+        default=0.0,
+        help=(
+            "Normalized source-center radius for radius-topk attention. "
+            "0 disables radius filtering; use with --local_topk for source-guided local reconstruction."
+        ),
+    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -768,6 +782,7 @@ def main() -> int:
         ff_mult=args.ff_mult,
         dropout=args.dropout,
         local_topk=args.local_topk,
+        local_radius=args.local_radius,
     ).to(device=device, dtype=reconstructor_dtype)
 
     dataset = SGCSRCompressedDataset(

@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dim_head", type=int, default=64)
     parser.add_argument("--local_topk", type=int, default=0)
+    parser.add_argument("--local_radius", type=float, default=0.0)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
@@ -37,6 +38,7 @@ def main() -> int:
         heads=args.heads,
         dim_head=args.dim_head,
         local_topk=args.local_topk,
+        local_radius=args.local_radius,
     ).to(device)
     model.eval()
 
@@ -84,6 +86,8 @@ def main() -> int:
         "input_shape": list(visual_embeddings.shape),
         "attention_mask_shape": list(attention_mask.shape),
         "query_grid": list(model.grid_size),
+        "local_topk": args.local_topk,
+        "local_radius": args.local_radius,
         "output_shape": list(reconstructed.shape),
         "teacher_compact_shape": list(teacher_compact.shape),
         "distill_loss": float(loss.item()),

@@ -122,7 +122,13 @@ class SourceAwareTokenEncoder(nn.Module):
 
 
 class SpatialCrossAttention(nn.Module):
-    """Cross-attention from compact reconstruction queries to source-aware tokens."""
+    """Cross-attention from compact reconstruction queries to source-aware tokens.
+
+    Locality is enforced only by an optional source-map radius/top-k mask. We
+    intentionally do not add an extra distance-based spatial bias to the
+    attention logits, so the model can decide the relative importance of local
+    candidate tokens from QK similarity.
+    """
 
     def __init__(self, dim: int, dim_head: int = 128, heads: int = 8, dropout: float = 0.0):
         super().__init__()
@@ -139,21 +145,15 @@ class SpatialCrossAttention(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Learnable source priors. The distance term encourages each compact
-        # query to read from nearby ToMe source regions, while size bias lets the
-        # model treat large merged tokens differently from small precise tokens.
-        self.size_bias = nn.Linear(1, heads, bias=False)
-        self.spatial_bias_log_scale = nn.Parameter(torch.tensor(-2.0))
-
     def forward(
         self,
         queries: torch.Tensor,
         source_tokens: torch.Tensor,
         query_centers: torch.Tensor,
         token_centers: torch.Tensor,
-        token_sizes: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         local_topk: Optional[int] = None,
+        local_radius: Optional[float] = None,
     ) -> torch.Tensor:
         bsz, num_queries, _ = queries.shape
         num_tokens = source_tokens.shape[1]
@@ -168,14 +168,6 @@ class SpatialCrossAttention(nn.Module):
 
         sim = torch.einsum("b h m d, b h n d -> b h m n", q * self.scale, k)
 
-        # Source-guided spatial prior: query grid location vs. ToMe token center.
-        dist2 = (query_centers[None, :, None, :] - token_centers[:, None, :, :]).pow(2).sum(dim=-1)
-        spatial_scale = F.softplus(self.spatial_bias_log_scale)
-        sim = sim - spatial_scale * dist2[:, None, :, :]
-
-        size_bias = self.size_bias(token_sizes.unsqueeze(-1)).transpose(1, 2)
-        sim = sim + size_bias[:, :, None, :]
-
         valid_mask = None
         if attention_mask is not None:
             if attention_mask.shape != source_tokens.shape[:2]:
@@ -188,24 +180,55 @@ class SpatialCrossAttention(nn.Module):
                 raise ValueError("Each sample must contain at least one valid compressed visual token.")
             sim = sim.masked_fill(~valid_mask[:, None, None, :], torch.finfo(sim.dtype).min)
 
-        # Optional local attention keeps each compact grid slot focused on nearby
-        # source regions. Set local_topk <= 0 to use full cross-attention.
-        if local_topk is not None and local_topk > 0:
-            k_top = min(int(local_topk), num_tokens)
-            local_scores = -dist2
+        # Optional source-guided radius/top-k mask. This decides which
+        # compressed tokens each compact query may read from; within that local
+        # candidate set, attention weights are still determined by semantic QK
+        # similarity.
+        no_candidate_mask = None
+        use_topk = local_topk is not None and local_topk > 0
+        use_radius = local_radius is not None and local_radius > 0
+        if use_topk or use_radius:
+            dist2 = (query_centers[None, :, None, :] - token_centers[:, None, :, :]).pow(2).sum(dim=-1)
+
+            candidate_mask = torch.ones((bsz, num_queries, num_tokens), dtype=torch.bool, device=source_tokens.device)
             if valid_mask is not None:
-                local_scores = local_scores.masked_fill(~valid_mask[:, None, :], torch.finfo(local_scores.dtype).min)
-            top_idx = local_scores.topk(k=k_top, dim=-1).indices
-            local_mask = torch.zeros((bsz, num_queries, num_tokens), dtype=torch.bool, device=source_tokens.device)
-            local_mask.scatter_(dim=-1, index=top_idx, value=True)
+                candidate_mask = candidate_mask & valid_mask[:, None, :]
+
+            if use_radius:
+                candidate_mask = candidate_mask & dist2.le(float(local_radius) ** 2)
+
+            if use_topk:
+                k_top = min(int(local_topk), num_tokens)
+                local_scores = -dist2
+                if valid_mask is not None:
+                    local_scores = local_scores.masked_fill(
+                        ~valid_mask[:, None, :],
+                        torch.finfo(local_scores.dtype).min,
+                    )
+                top_idx = local_scores.topk(k=k_top, dim=-1).indices
+                topk_mask = torch.zeros((bsz, num_queries, num_tokens), dtype=torch.bool, device=source_tokens.device)
+                topk_mask.scatter_(dim=-1, index=top_idx, value=True)
+                candidate_mask = candidate_mask & topk_mask
+
+            # If a query has no token inside its radius, do not pull distant
+            # tokens across the image. We temporarily unmask valid tokens only
+            # to keep softmax finite, then zero the cross-attention update for
+            # those empty local regions below.
+            no_candidate_mask = ~candidate_mask.any(dim=-1)
             if valid_mask is not None:
-                local_mask = local_mask & valid_mask[:, None, :]
-            sim = sim.masked_fill(~local_mask[:, None, :, :], torch.finfo(sim.dtype).min)
+                fallback_mask = valid_mask[:, None, :].expand_as(candidate_mask)
+            else:
+                fallback_mask = torch.ones_like(candidate_mask)
+            safe_mask = torch.where(no_candidate_mask[:, :, None], fallback_mask, candidate_mask)
+
+            sim = sim.masked_fill(~safe_mask[:, None, :, :], torch.finfo(sim.dtype).min)
 
         sim = sim - sim.amax(dim=-1, keepdim=True).detach()
         attn = sim.softmax(dim=-1)
         out = torch.einsum("b h m n, b h n d -> b h m d", attn, v)
         out = out.transpose(1, 2).contiguous().reshape(bsz, num_queries, -1)
+        if no_candidate_mask is not None:
+            out = out.masked_fill(no_candidate_mask[:, :, None], 0.0)
         return self.to_out(out)
 
 
@@ -244,9 +267,11 @@ class ReconstructionBlock(nn.Module):
         ff_mult: int = 2,
         dropout: float = 0.0,
         local_topk: int = 0,
+        local_radius: float = 0.0,
     ):
         super().__init__()
         self.local_topk = local_topk
+        self.local_radius = local_radius
         self.cross_attn = SpatialCrossAttention(dim=dim, dim_head=dim_head, heads=heads, dropout=dropout)
         self.smooth = SpatialSmoothBlock(dim=dim, grid_size=grid_size)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout)
@@ -257,7 +282,6 @@ class ReconstructionBlock(nn.Module):
         source_tokens: torch.Tensor,
         query_centers: torch.Tensor,
         token_centers: torch.Tensor,
-        token_sizes: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         queries = queries + self.cross_attn(
@@ -265,9 +289,9 @@ class ReconstructionBlock(nn.Module):
             source_tokens=source_tokens,
             query_centers=query_centers,
             token_centers=token_centers,
-            token_sizes=token_sizes,
             attention_mask=attention_mask,
             local_topk=self.local_topk,
+            local_radius=self.local_radius,
         )
         queries = self.smooth(queries)
         queries = queries + self.ff(queries)
@@ -299,6 +323,7 @@ class SourceGuidedCompactSemanticReconstructor(nn.Module):
         ff_mult: int = 2,
         dropout: float = 0.0,
         local_topk: int = 0,
+        local_radius: float = 0.0,
         grid_size: Optional[Tuple[int, int]] = None,
     ):
         super().__init__()
@@ -325,6 +350,7 @@ class SourceGuidedCompactSemanticReconstructor(nn.Module):
                     ff_mult=ff_mult,
                     dropout=dropout,
                     local_topk=local_topk,
+                    local_radius=local_radius,
                 )
                 for _ in range(max(1, depth))
             ]
@@ -384,7 +410,6 @@ class SourceGuidedCompactSemanticReconstructor(nn.Module):
                 source_tokens=source_tokens,
                 query_centers=query_centers,
                 token_centers=token_centers,
-                token_sizes=token_sizes,
                 attention_mask=attention_mask,
             )
 
