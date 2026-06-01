@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -38,6 +39,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_path", type=str, required=True, help="Compressed feature directory, .pt file, or manifest.jsonl.")
     parser.add_argument("--image_folder", type=str, default=None, help="Image root used when manifest records only contain image_id.")
     parser.add_argument("--output_dir", type=str, default="outputs/sgcsr_k144")
+    parser.add_argument(
+        "--init_checkpoint_path",
+        type=str,
+        default=None,
+        help="Optional SGCSR checkpoint to initialize from before training, e.g. the pretrain-stage best.pt.",
+    )
+    parser.add_argument(
+        "--allow_checkpoint_config_mismatch",
+        action="store_true",
+        help="Allow initializing from a checkpoint whose SGCSR architecture/locality args differ from current args.",
+    )
     parser.add_argument("--local_files_only", action="store_true", help="Only load model/tokenizer files from local cache/path.")
     parser.add_argument("--num_queries", type=int, default=144, help="K reconstructed semantic tokens.")
     parser.add_argument("--depth", type=int, default=2)
@@ -68,7 +80,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=1)
-    parser.add_argument("--test_ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--test_ratio",
+        type=float,
+        default=0.2,
+        help=(
+            "Backward-compatible validation ratio. Used only when --val_ratio is not set. "
+            "For formal train/val/test runs, prefer --val_ratio and --final_test_ratio."
+        ),
+    )
+    parser.add_argument(
+        "--val_ratio",
+        type=float,
+        default=None,
+        help="Validation ratio used for selecting best.pt. If omitted, falls back to --test_ratio.",
+    )
+    parser.add_argument(
+        "--final_test_ratio",
+        type=float,
+        default=0.0,
+        help="Held-out test ratio evaluated only after training. It is never used to select best.pt.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"])
@@ -102,6 +134,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--logit_temperature", type=float, default=1.0)
     parser.add_argument("--max_samples", type=int, default=0, help="Debug only; 0 means all samples.")
+    parser.add_argument(
+        "--max_text_length",
+        type=int,
+        default=0,
+        help=(
+            "Optional cap on text tokens before replacing <image> with visual tokens. "
+            "0 disables truncation. Useful for long stage-2 multi-turn conversations."
+        ),
+    )
+    parser.add_argument(
+        "--conversation_mode",
+        type=str,
+        default="first",
+        choices=["first", "all", "full"],
+        help=(
+            "How to use multi-turn conversations. 'first' keeps the original stage-1 behavior; "
+            "'all' expands every user-assistant QA pair into a separate training example; "
+            "'full' keeps the whole multi-turn conversation and supervises all assistant replies."
+        ),
+    )
     parser.add_argument("--save_every_epoch", action="store_true")
     parser.add_argument(
         "--allow_missing_source",
@@ -179,22 +231,72 @@ def normalize_turns(conversations: Sequence[Dict[str, str]]) -> List[Tuple[str, 
 
 
 def first_user_assistant_pair(conversations: Sequence[Dict[str, str]]) -> Tuple[str, str]:
-    turns = normalize_turns(conversations)
-    for i, (role, content) in enumerate(turns):
-        if role != "user":
-            continue
-        for next_role, next_content in turns[i + 1 :]:
-            if next_role == "assistant":
-                question = content.replace("<image>", "").strip()
-                answer = next_content.strip()
-                if question and answer:
-                    return question, answer
+    pairs = user_assistant_pairs(conversations)
+    if pairs:
+        return pairs[0]
     raise ValueError("Each sample needs at least one user turn followed by one assistant answer.")
 
 
-def build_llava_training_example(tokenizer, conversations: Sequence[Dict[str, str]]) -> Dict[str, torch.Tensor]:
+def user_assistant_pairs(conversations: Sequence[Dict[str, str]]) -> List[Tuple[str, str]]:
+    """Extract supervised QA pairs from a LLaVA-style multi-turn conversation.
+
+    The stage-1 pretrain file is mostly single-turn, while LLaVA-1.5 stage-2
+    data often contains several user/assistant rounds for one image.  We keep
+    each round independent because the cloud module receives the same visual
+    features, but the text supervision should cover every answer.
+    """
+    pairs: List[Tuple[str, str]] = []
+    pending_user: Optional[str] = None
+    for role, content in normalize_turns(conversations):
+        if role == "user":
+            pending_user = content.replace("<image>", "").strip()
+        elif role == "assistant" and pending_user is not None:
+            answer = content.strip()
+            if pending_user and answer:
+                pairs.append((pending_user, answer))
+            pending_user = None
+    return pairs
+
+
+def append_question_suffix_to_conversations(
+    conversations: Sequence[Dict[str, str]],
+    question_suffix: str,
+) -> List[Dict[str, str]]:
+    """Append a task instruction to user turns without changing answers.
+
+    POPE evaluation scores yes/no likelihood with an explicit suffix.  During
+    POPE-domain adaptation we keep the supervised answer unchanged, but train
+    with the same question wording used by the evaluator.
+    """
+    suffix = question_suffix.strip()
+    if not suffix:
+        return [dict(item) for item in conversations]
+
+    updated: List[Dict[str, str]] = []
+    for item in conversations:
+        cloned = dict(item)
+        role = str(cloned.get("from", "")).strip().lower()
+        value = str(cloned.get("value", ""))
+        lower_value = value.lower()
+        if role in {"human", "user", "question"} and suffix.lower() not in lower_value and "yes or no" not in lower_value:
+            value = value.rstrip()
+            cloned["value"] = f"{value}\n{suffix}" if value else suffix
+        updated.append(cloned)
+    return updated
+
+
+def build_llava_training_example(
+    tokenizer,
+    conversations: Sequence[Dict[str, str]],
+    pair_index: int = 0,
+) -> Dict[str, torch.Tensor]:
     """Build one LLaVA-style supervised example with assistant-only labels."""
-    question, answer = first_user_assistant_pair(conversations)
+    pairs = user_assistant_pairs(conversations)
+    if not pairs:
+        raise ValueError("Each sample needs at least one user turn followed by one assistant answer.")
+    if pair_index < 0 or pair_index >= len(pairs):
+        raise IndexError(f"pair_index={pair_index} out of range for {len(pairs)} QA pairs.")
+    question, answer = pairs[pair_index]
     prefix = f"USER: <image>\n{question} ASSISTANT:"
     answer_text = " " + answer
     if tokenizer.eos_token and not answer_text.rstrip().endswith(tokenizer.eos_token):
@@ -209,6 +311,88 @@ def build_llava_training_example(tokenizer, conversations: Sequence[Dict[str, st
     labels = input_ids.clone()
     labels[: len(prefix_ids)] = -100
     attention_mask = torch.ones_like(input_ids)
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
+def build_llava_full_conversation_example(
+    tokenizer,
+    conversations: Sequence[Dict[str, str]],
+) -> Dict[str, torch.Tensor]:
+    """Build a full multi-turn LLaVA example with labels on every assistant turn.
+
+    This is the closest mode to LLaVA stage-2 instruction tuning: the first user
+    turn contains the single <image> placeholder, later user turns provide text
+    context, and every assistant answer contributes supervised tokens.
+    """
+    turns = normalize_turns(conversations)
+    input_ids: List[int] = []
+    labels: List[int] = []
+    has_image = False
+    waiting_for_assistant = False
+    supervised_tokens = 0
+
+    for role, content in turns:
+        if role == "user":
+            question = content.replace("<image>", "").strip()
+            if not question:
+                continue
+            if not has_image:
+                segment = f"USER: <image>\n{question} ASSISTANT:"
+                has_image = True
+            else:
+                segment = f" USER: {question} ASSISTANT:"
+            segment_ids = tokenizer(segment, add_special_tokens=(len(input_ids) == 0)).input_ids
+            input_ids.extend(segment_ids)
+            labels.extend([-100] * len(segment_ids))
+            waiting_for_assistant = True
+            continue
+
+        if role == "assistant" and waiting_for_assistant:
+            answer_text = " " + content.strip()
+            if not answer_text.strip():
+                waiting_for_assistant = False
+                continue
+            if tokenizer.eos_token and not answer_text.rstrip().endswith(tokenizer.eos_token):
+                answer_text = answer_text + tokenizer.eos_token
+            answer_ids = tokenizer(answer_text, add_special_tokens=False).input_ids
+            if answer_ids:
+                input_ids.extend(answer_ids)
+                labels.extend(answer_ids)
+                supervised_tokens += len(answer_ids)
+            waiting_for_assistant = False
+
+    if not has_image:
+        raise ValueError("Full conversation example has no valid user turn for the <image> placeholder.")
+    if supervised_tokens == 0:
+        raise ValueError("Full conversation example has no supervised assistant tokens.")
+
+    input_ids_t = torch.tensor(input_ids, dtype=torch.long)
+    labels_t = torch.tensor(labels, dtype=torch.long)
+    attention_mask_t = torch.ones_like(input_ids_t)
+    return {"input_ids": input_ids_t, "attention_mask": attention_mask_t, "labels": labels_t}
+
+
+def truncate_training_example(
+    example: Dict[str, torch.Tensor],
+    max_text_length: int,
+    image_token_id: int,
+) -> Dict[str, torch.Tensor]:
+    """Right-truncate long text sequences while keeping the single image token.
+
+    LLaVA stage-2 conversations can be much longer than pretrain captions.
+    Right truncation preserves the leading <image> token and early dialogue
+    context. We reject truncations that would remove all supervised tokens.
+    """
+    if max_text_length <= 0 or int(example["input_ids"].numel()) <= max_text_length:
+        return example
+
+    input_ids = example["input_ids"][:max_text_length].clone()
+    attention_mask = example["attention_mask"][:max_text_length].clone()
+    labels = example["labels"][:max_text_length].clone()
+    if int(input_ids.eq(image_token_id).sum().item()) != 1:
+        raise ValueError("Truncation removed or duplicated the <image> token; increase --max_text_length.")
+    if not bool(labels.ne(-100).any()):
+        raise ValueError("Truncation removed all supervised assistant tokens; increase --max_text_length.")
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
@@ -274,40 +458,106 @@ class SGCSRCompressedDataset(Dataset):
         max_samples: int = 0,
         allow_missing_source: bool = False,
         seed: int = 42,
+        conversation_mode: str = "first",
+        max_text_length: int = 0,
+        image_token_id: int = 32000,
+        question_suffix: str = "",
     ):
         self.image_folder = image_folder
         self.tokenizer = tokenizer
         self.allow_missing_source = allow_missing_source
+        self.max_text_length = max_text_length
+        self.image_token_id = int(image_token_id)
+        self.question_suffix = question_suffix
+        self.conversation_mode = conversation_mode
+        if self.conversation_mode not in {"first", "all", "full"}:
+            raise ValueError(f"Unsupported conversation_mode: {self.conversation_mode}")
 
         root = Path(data_path)
-        self.items: List[Any] = []
         if root.is_file() and root.suffix == ".pt":
-            self.items = [root]
+            base_items: List[Any] = [root]
         elif root.is_dir():
             pt_files = sorted([p for p in root.rglob("*.pt") if p.name not in {"best.pt", "last.pt"}])
             if pt_files:
-                self.items = pt_files
+                base_items = pt_files
             else:
-                self.items = load_manifest_records(data_path)
+                base_items = load_manifest_records(data_path)
         elif root.is_file() and root.name.endswith(".jsonl"):
-            self.items = load_manifest_records(data_path)
+            base_items = load_manifest_records(data_path)
         else:
             raise ValueError(f"Invalid compressed data path: {data_path}")
 
-        if not self.items:
+        if not base_items:
             raise ValueError(f"No compressed samples found under {data_path}")
-        if max_samples and max_samples > 0 and max_samples < len(self.items):
-            self.items = self._balanced_subset_by_retain_ratio(self.items, max_samples, seed)
+        if max_samples and max_samples > 0 and max_samples < len(base_items):
+            base_items = self._balanced_subset_by_retain_ratio(base_items, max_samples, seed)
+
+        self.base_items = base_items
+        self.items = self._expand_conversation_items(base_items)
 
     def __len__(self) -> int:
         return len(self.items)
 
     @staticmethod
-    def _item_retain_ratio(item: Any) -> float:
-        if isinstance(item, tuple):
-            payload = item[1]
+    def _base_item_payload(base_item: Any) -> Dict[str, Any]:
+        if isinstance(base_item, tuple):
+            return base_item[1]
+        return torch.load(base_item, map_location="cpu")
+
+    @staticmethod
+    def _unpack_item(item: Any) -> Tuple[Any, int, int]:
+        if isinstance(item, dict) and "base_item" in item:
+            return item["base_item"], int(item["pair_index"]), int(item["base_index"])
+        return item, 0, -1
+
+    @classmethod
+    def _item_payload(cls, item: Any) -> Dict[str, Any]:
+        base_item, _, _ = cls._unpack_item(item)
+        return cls._base_item_payload(base_item)
+
+    @classmethod
+    def _item_retain_ratio(cls, item: Any) -> float:
+        payload = cls._item_payload(item)
+
+        retain_ratio = payload.get("actual_retain_ratio", payload.get("retain_ratio"))
+        if retain_ratio is None:
+            compressed_count = payload.get("compressed_token_count", payload.get("actual_keep_tokens"))
+            if compressed_count is None:
+                raise ValueError("Sample is missing retain_ratio and token-count metadata.")
+            retain_ratio = float(compressed_count) / 576.0
+        return float(retain_ratio)
+
+    def _expand_conversation_items(self, base_items: Sequence[Any]) -> List[Dict[str, Any]]:
+        expanded: List[Dict[str, Any]] = []
+        for base_index, base_item in enumerate(base_items):
+            payload = self._base_item_payload(base_item)
+            pairs = user_assistant_pairs(payload.get("conversations", []))
+            if not pairs:
+                continue
+            if self.conversation_mode == "all":
+                pair_indices = range(len(pairs))
+            elif self.conversation_mode == "full":
+                pair_indices = [-1]
+            else:
+                pair_indices = range(1)
+            for pair_index in pair_indices:
+                expanded.append(
+                    {
+                        "base_item": base_item,
+                        "base_index": base_index,
+                        "pair_index": int(pair_index),
+                    }
+                )
+        if not expanded:
+            raise ValueError("No valid user-assistant QA pairs found in compressed samples.")
+        return expanded
+
+    @staticmethod
+    def _base_item_retain_ratio(base_item: Any) -> float:
+        if isinstance(base_item, tuple):
+            payload = base_item[1]
         else:
-            payload = torch.load(item, map_location="cpu")
+            payload = torch.load(base_item, map_location="cpu")
 
         retain_ratio = payload.get("actual_retain_ratio", payload.get("retain_ratio"))
         if retain_ratio is None:
@@ -321,7 +571,7 @@ class SGCSRCompressedDataset(Dataset):
     def _balanced_subset_by_retain_ratio(cls, items: Sequence[Any], max_samples: int, seed: int) -> List[Any]:
         groups: Dict[str, List[Any]] = {}
         for item in items:
-            ratio_key = f"{cls._item_retain_ratio(item):.2f}"
+            ratio_key = f"{cls._base_item_retain_ratio(item):.2f}"
             groups.setdefault(ratio_key, []).append(item)
 
         generator = torch.Generator().manual_seed(seed)
@@ -344,8 +594,13 @@ class SGCSRCompressedDataset(Dataset):
         """Read retain ratio metadata without loading the feature tensor when possible."""
         return self._item_retain_ratio(self.items[idx])
 
+    def get_group_id(self, idx: int) -> int:
+        """Return the compressed-image id used to keep expanded QA pairs in one split."""
+        _, _, base_index = self._unpack_item(self.items[idx])
+        return idx if base_index < 0 else base_index
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        item = self.items[idx]
+        item, pair_index, _ = self._unpack_item(self.items[idx])
         if isinstance(item, tuple):
             shard_root, record = item
             payload = record
@@ -382,7 +637,19 @@ class SGCSRCompressedDataset(Dataset):
             else:
                 raise ValueError("Missing ToMe source map. Regenerate data without --no_source for SGCSR training.")
 
-        text = build_llava_training_example(self.tokenizer, payload.get("conversations", []))
+        conversations = payload.get("conversations", [])
+        if self.question_suffix:
+            conversations = append_question_suffix_to_conversations(conversations, self.question_suffix)
+
+        if pair_index < 0:
+            text = build_llava_full_conversation_example(self.tokenizer, conversations)
+        else:
+            text = build_llava_training_example(
+                self.tokenizer,
+                conversations,
+                pair_index=pair_index,
+            )
+        text = truncate_training_example(text, self.max_text_length, self.image_token_id)
         image_path = resolve_image_path(self.image_folder, payload)
         retain_ratio = payload.get("actual_retain_ratio", payload.get("retain_ratio"))
         if retain_ratio is None:
@@ -434,53 +701,91 @@ class SGCSRCollator:
         }
 
 
-def build_stratified_train_eval_split(
+def build_stratified_train_val_test_split(
     dataset: SGCSRCompressedDataset,
-    test_ratio: float,
+    val_ratio: float,
+    final_test_ratio: float,
     seed: int,
-) -> Tuple[Subset, Optional[Subset], Dict[str, Dict[str, int]]]:
-    """Split each retain-ratio bucket into train/eval.
+) -> Tuple[Subset, Optional[Subset], Optional[Subset], Dict[str, Dict[str, int]]]:
+    """Split each retain-ratio bucket into train/val/test.
 
     This guarantees that 0.2/0.4/0.6/0.8 compression levels are represented in
-    both train and eval with the same ratio, instead of relying on global random
-    split to be balanced by chance.
+    train, validation, and final test with the same ratio when enough samples
+    exist. Validation is used to select best.pt; final test is held out until
+    the end and is never used for checkpoint selection.
     """
-    if not 0 <= test_ratio < 1:
-        raise ValueError(f"test_ratio must be in [0, 1), got {test_ratio}")
+    if not 0 <= val_ratio < 1:
+        raise ValueError(f"val_ratio must be in [0, 1), got {val_ratio}")
+    if not 0 <= final_test_ratio < 1:
+        raise ValueError(f"final_test_ratio must be in [0, 1), got {final_test_ratio}")
+    if val_ratio + final_test_ratio >= 1:
+        raise ValueError(
+            "val_ratio + final_test_ratio must be < 1 so at least one train split remains; "
+            f"got {val_ratio + final_test_ratio}"
+        )
 
-    groups: Dict[str, List[int]] = {}
+    groups: Dict[str, Dict[int, List[int]]] = {}
     for idx in range(len(dataset)):
         ratio_key = f"{dataset.get_retain_ratio(idx):.2f}"
-        groups.setdefault(ratio_key, []).append(idx)
+        group_id = dataset.get_group_id(idx)
+        groups.setdefault(ratio_key, {}).setdefault(group_id, []).append(idx)
 
     generator = torch.Generator().manual_seed(seed)
     train_indices: List[int] = []
-    eval_indices: List[int] = []
+    val_indices: List[int] = []
+    test_indices: List[int] = []
     summary: Dict[str, Dict[str, int]] = {}
 
     for ratio_key in sorted(groups.keys(), key=float):
-        indices = groups[ratio_key]
-        order = torch.randperm(len(indices), generator=generator).tolist()
-        shuffled = [indices[i] for i in order]
+        grouped_indices = list(groups[ratio_key].values())
+        order = torch.randperm(len(grouped_indices), generator=generator).tolist()
+        shuffled_groups = [grouped_indices[i] for i in order]
+        num_groups = len(shuffled_groups)
 
-        if test_ratio > 0 and len(shuffled) > 1:
-            eval_len = max(1, int(len(shuffled) * test_ratio))
+        if val_ratio > 0 and num_groups > 1:
+            val_group_len = max(1, int(num_groups * val_ratio))
         else:
-            eval_len = 0
+            val_group_len = 0
+        if final_test_ratio > 0 and num_groups > 1:
+            test_group_len = max(1, int(num_groups * final_test_ratio))
+        else:
+            test_group_len = 0
 
-        eval_part = shuffled[:eval_len]
-        train_part = shuffled[eval_len:]
+        # Tiny debug subsets may not be large enough for all three splits. Keep
+        # at least one group for training, then shrink holdouts deterministically.
+        max_holdout_groups = max(0, num_groups - 1)
+        while val_group_len + test_group_len > max_holdout_groups:
+            if test_group_len >= val_group_len and test_group_len > 0:
+                test_group_len -= 1
+            elif val_group_len > 0:
+                val_group_len -= 1
+            else:
+                break
+
+        test_groups = shuffled_groups[:test_group_len]
+        val_groups = shuffled_groups[test_group_len : test_group_len + val_group_len]
+        train_groups = shuffled_groups[test_group_len + val_group_len :]
+        test_part = [idx for group in test_groups for idx in group]
+        val_part = [idx for group in val_groups for idx in group]
+        train_part = [idx for group in train_groups for idx in group]
         train_indices.extend(train_part)
-        eval_indices.extend(eval_part)
+        val_indices.extend(val_part)
+        test_indices.extend(test_part)
         summary[ratio_key] = {
-            "total": len(shuffled),
+            "total": len(train_part) + len(val_part) + len(test_part),
             "train": len(train_part),
-            "eval": len(eval_part),
+            "val": len(val_part),
+            "test": len(test_part),
+            "base_groups": len(shuffled_groups),
+            "train_groups": len(train_groups),
+            "val_groups": len(val_groups),
+            "test_groups": len(test_groups),
         }
 
     train_ds = Subset(dataset, train_indices)
-    eval_ds = Subset(dataset, eval_indices) if eval_indices else None
-    return train_ds, eval_ds, summary
+    val_ds = Subset(dataset, val_indices) if val_indices else None
+    test_ds = Subset(dataset, test_indices) if test_indices else None
+    return train_ds, val_ds, test_ds, summary
 
 
 def build_teacher_visual_embeddings(
@@ -708,17 +1013,110 @@ def save_checkpoint(reconstructor, output_dir: str, name: str, args: argparse.Na
     )
 
 
+def load_reconstructor_checkpoint(
+    reconstructor,
+    checkpoint_path: str,
+    device: torch.device,
+    args: argparse.Namespace,
+):
+    """Initialize SGCSR weights from a previous training checkpoint."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    saved_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+    config_keys = ["num_queries", "depth", "heads", "dim_head", "ff_mult", "local_topk", "local_radius"]
+    mismatches = []
+    for key in config_keys:
+        if key not in saved_args:
+            continue
+        current_value = getattr(args, key)
+        saved_value = saved_args[key]
+        if isinstance(current_value, float) or isinstance(saved_value, float):
+            same = abs(float(current_value) - float(saved_value)) < 1e-9
+        else:
+            same = current_value == saved_value
+        if not same:
+            mismatches.append(f"{key}: checkpoint={saved_value} current={current_value}")
+    if mismatches and not args.allow_checkpoint_config_mismatch:
+        raise ValueError(
+            "SGCSR checkpoint config does not match current training args. "
+            "This can silently change reconstructor behavior during stage-2 continuation. "
+            "Pass matching args or use --allow_checkpoint_config_mismatch for an intentional ablation. "
+            + "; ".join(mismatches)
+        )
+
+    state_dict = checkpoint.get("reconstructor", checkpoint)
+    reconstructor.load_state_dict(state_dict, strict=True)
+    step = checkpoint.get("step", None) if isinstance(checkpoint, dict) else None
+    eval_loss = checkpoint.get("eval_loss", None) if isinstance(checkpoint, dict) else None
+    print(f"[SGCSR] initialized from {checkpoint_path} step={step} eval_loss={eval_loss}")
+
+
 def log_jsonl(path: str, record: Dict[str, Any]):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def evaluate(model, reconstructor, image_processor, eval_loader, device, model_dtype, reconstructor_dtype, args) -> Dict[str, float]:
+def subset_indices(subset: Optional[Subset]) -> List[int]:
+    """Return JSON-serializable indices from a torch Subset."""
+    if subset is None:
+        return []
+    return [int(idx) for idx in subset.indices]
+
+
+def save_split_indices(
+    output_dir: str,
+    args: argparse.Namespace,
+    train_ds: Subset,
+    val_ds: Optional[Subset],
+    test_ds: Optional[Subset],
+    split_summary: Dict[str, Dict[str, int]],
+    val_ratio: float,
+    final_test_ratio: float,
+) -> None:
+    """Persist exact train/val/test membership for reproducible evaluation.
+
+    The saved indices refer to SGCSRCompressedDataset after optional max_samples
+    filtering and conversation expansion. This lets later evaluation scripts
+    reuse the same uncontaminated final-test split instead of reconstructing it
+    implicitly from seed and ratio.
+    """
+    payload = {
+        "format": "sgcsr_split_indices_v1",
+        "indices_are": "indices into SGCSRCompressedDataset after max_samples filtering and conversation expansion",
+        "data_path": args.data_path,
+        "image_folder": args.image_folder,
+        "seed": int(args.seed),
+        "conversation_mode": args.conversation_mode,
+        "max_samples": int(args.max_samples),
+        "max_text_length": int(args.max_text_length),
+        "val_ratio": float(val_ratio),
+        "final_test_ratio": float(final_test_ratio),
+        "split_mode": "stratified_by_retain_ratio_train_val_test",
+        "split_summary": split_summary,
+        "train": subset_indices(train_ds),
+        "val": subset_indices(val_ds),
+        "test": subset_indices(test_ds),
+    }
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "split_indices.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+
+
+def evaluate(
+    model,
+    reconstructor,
+    image_processor,
+    eval_loader,
+    device,
+    model_dtype,
+    reconstructor_dtype,
+    args,
+    split_name: str = "Eval",
+) -> Dict[str, float]:
     model.eval()
     reconstructor.eval()
     totals = {"loss": 0.0, "task_loss": 0.0, "rec_loss": 0.0, "logit_loss": 0.0, "count": 0.0}
     with torch.no_grad():
-        for batch in tqdm(eval_loader, desc="Eval", dynamic_ncols=True):
+        for batch in tqdm(eval_loader, desc=split_name, dynamic_ncols=True):
             losses = forward_losses(
                 model=model,
                 reconstructor=reconstructor,
@@ -784,6 +1182,8 @@ def main() -> int:
         local_topk=args.local_topk,
         local_radius=args.local_radius,
     ).to(device=device, dtype=reconstructor_dtype)
+    if args.init_checkpoint_path:
+        load_reconstructor_checkpoint(reconstructor, args.init_checkpoint_path, device, args)
 
     dataset = SGCSRCompressedDataset(
         data_path=args.data_path,
@@ -792,14 +1192,21 @@ def main() -> int:
         max_samples=args.max_samples,
         allow_missing_source=args.allow_missing_source,
         seed=args.seed,
+        conversation_mode=args.conversation_mode,
+        max_text_length=args.max_text_length,
+        image_token_id=int(getattr(model.config, "image_token_index", 32000)),
     )
-    train_ds, eval_ds, split_summary = build_stratified_train_eval_split(
+    val_ratio = float(args.test_ratio if args.val_ratio is None else args.val_ratio)
+    final_test_ratio = float(args.final_test_ratio)
+    train_ds, val_ds, test_ds, split_summary = build_stratified_train_val_test_split(
         dataset=dataset,
-        test_ratio=float(args.test_ratio),
+        val_ratio=val_ratio,
+        final_test_ratio=final_test_ratio,
         seed=args.seed,
     )
     train_len = len(train_ds)
-    eval_len = len(eval_ds) if eval_ds is not None else 0
+    val_len = len(val_ds) if val_ds is not None else 0
+    test_len = len(test_ds) if test_ds is not None else 0
 
     collator = SGCSRCollator(pad_token_id=tokenizer.pad_token_id)
     train_loader = DataLoader(
@@ -809,26 +1216,50 @@ def main() -> int:
         num_workers=args.num_workers,
         collate_fn=collator,
     )
-    eval_loader = (
+    val_loader = (
         DataLoader(
-            eval_ds,
+            val_ds,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=collator,
         )
-        if eval_ds is not None
+        if val_ds is not None
+        else None
+    )
+    test_loader = (
+        DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collator,
+        )
+        if test_ds is not None
         else None
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
+    save_split_indices(
+        output_dir=args.output_dir,
+        args=args,
+        train_ds=train_ds,
+        val_ds=val_ds,
+        test_ds=test_ds,
+        split_summary=split_summary,
+        val_ratio=val_ratio,
+        final_test_ratio=final_test_ratio,
+    )
     with open(os.path.join(args.output_dir, "train_config.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
                 **vars(args),
                 "train_samples": train_len,
-                "eval_samples": eval_len,
-                "split_mode": "stratified_by_retain_ratio",
+                "val_samples": val_len,
+                "test_samples": test_len,
+                "effective_val_ratio": val_ratio,
+                "effective_final_test_ratio": final_test_ratio,
+                "split_mode": "stratified_by_retain_ratio_train_val_test",
                 "split_summary": split_summary,
                 "hidden_size": hidden_size,
                 "grid_size": list(reconstructor.grid_size),
@@ -839,7 +1270,10 @@ def main() -> int:
         )
 
     optimizer = torch.optim.AdamW(reconstructor.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    total_update_steps = max(1, (len(train_loader) * args.epochs) // max(1, args.gradient_accumulation_steps))
+    total_update_steps = max(
+        1,
+        math.ceil((len(train_loader) * args.epochs) / max(1, args.gradient_accumulation_steps)),
+    )
     warmup_steps = max(1, int(total_update_steps * args.warmup_ratio))
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
@@ -848,13 +1282,15 @@ def main() -> int:
     )
 
     train_log_path = os.path.join(args.output_dir, "train_log.jsonl")
-    eval_log_path = os.path.join(args.output_dir, "eval_log.jsonl")
-    print(f"[SGCSR] train={train_len} eval={eval_len} grid={reconstructor.grid_size} device={device}")
+    val_log_path = os.path.join(args.output_dir, "val_log.jsonl")
+    legacy_eval_log_path = os.path.join(args.output_dir, "eval_log.jsonl")
+    test_log_path = os.path.join(args.output_dir, "test_log.jsonl")
+    print(f"[SGCSR] train={train_len} val={val_len} test={test_len} grid={reconstructor.grid_size} device={device}")
     print(f"[SGCSR] stratified split: {json.dumps(split_summary, ensure_ascii=False)}")
     print(f"[SGCSR] loss = {args.task_weight}*L_task + {args.rec_weight}*L_rec + {args.logit_weight}*L_logit")
 
     global_step = 0
-    best_eval = float("inf")
+    best_val = float("inf")
     for epoch in range(args.epochs):
         reconstructor.train()
         optimizer.zero_grad(set_to_none=True)
@@ -903,23 +1339,25 @@ def main() -> int:
         }
         log_jsonl(train_log_path, train_record)
 
-        eval_record = None
-        if eval_loader is not None:
-            eval_record = evaluate(
+        val_record = None
+        if val_loader is not None:
+            val_record = evaluate(
                 model=model,
                 reconstructor=reconstructor,
                 image_processor=image_processor,
-                eval_loader=eval_loader,
+                eval_loader=val_loader,
                 device=device,
                 model_dtype=model_dtype,
                 reconstructor_dtype=reconstructor_dtype,
                 args=args,
+                split_name="Val",
             )
-            eval_record = {"epoch": epoch + 1, "step": global_step, **eval_record}
-            log_jsonl(eval_log_path, eval_record)
-            if eval_record["loss"] < best_eval:
-                best_eval = float(eval_record["loss"])
-                save_checkpoint(reconstructor, args.output_dir, "best.pt", args, global_step, best_eval)
+            val_record = {"epoch": epoch + 1, "step": global_step, **val_record}
+            log_jsonl(val_log_path, val_record)
+            log_jsonl(legacy_eval_log_path, val_record)
+            if val_record["loss"] < best_val:
+                best_val = float(val_record["loss"])
+                save_checkpoint(reconstructor, args.output_dir, "best.pt", args, global_step, best_val)
 
         if args.save_every_epoch:
             save_checkpoint(
@@ -928,15 +1366,39 @@ def main() -> int:
                 f"epoch_{epoch + 1}.pt",
                 args,
                 global_step,
-                float(eval_record["loss"]) if eval_record is not None else float(train_record["loss"]),
+                float(val_record["loss"]) if val_record is not None else float(train_record["loss"]),
             )
 
-        print("[epoch]", json.dumps({"train": train_record, "eval": eval_record}, ensure_ascii=False))
+        print("[epoch]", json.dumps({"train": train_record, "val": val_record}, ensure_ascii=False))
 
-    save_checkpoint(reconstructor, args.output_dir, "last.pt", args, global_step, best_eval)
+    save_checkpoint(reconstructor, args.output_dir, "last.pt", args, global_step, best_val)
+
+    test_record = None
+    if test_loader is not None:
+        best_path = os.path.join(args.output_dir, "best.pt")
+        if os.path.exists(best_path):
+            load_reconstructor_checkpoint(reconstructor, best_path, device, args)
+        test_record = evaluate(
+            model=model,
+            reconstructor=reconstructor,
+            image_processor=image_processor,
+            eval_loader=test_loader,
+            device=device,
+            model_dtype=model_dtype,
+            reconstructor_dtype=reconstructor_dtype,
+            args=args,
+            split_name="Test",
+        )
+        test_record = {"step": global_step, "checkpoint": "best.pt" if os.path.exists(best_path) else "last.pt", **test_record}
+        log_jsonl(test_log_path, test_record)
+        with open(os.path.join(args.output_dir, "test_metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(test_record, f, indent=2, ensure_ascii=False)
+        print("[test]", json.dumps(test_record, ensure_ascii=False))
+
     print(f"[DONE] saved to {args.output_dir}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -40,3 +40,4 @@ checkpoints/
 models/
 
 outputs/
+logs/
