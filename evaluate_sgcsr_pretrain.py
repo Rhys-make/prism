@@ -54,6 +54,16 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         choices=["auto", "float16", "bfloat16", "float32"],
     )
+    parser.add_argument(
+        "--local_topk",
+        type=int,
+        default=None,
+        help=(
+            "Override the checkpoint local top-k for evaluation. "
+            "Use 8/16/32/64 for ablations, or 0 to disable top-k. "
+            "When omitted, the value stored in the checkpoint is used."
+        ),
+    )
     parser.add_argument("--batch_size", type=int, default=1, help="Keep at 1; groups have different visual lengths.")
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--test_ratio", type=float, default=0.2)
@@ -346,11 +356,16 @@ def _load_reconstructor(
     hidden_size: int,
     device: torch.device,
     dtype: torch.dtype,
+    local_topk_override: Optional[int] = None,
 ) -> SourceGuidedCompactSemanticReconstructor:
     payload = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(payload, dict) or "reconstructor" not in payload:
         raise ValueError(f"Unsupported SGCSR checkpoint format: {checkpoint_path}")
     ckpt_args = payload.get("args", {})
+    checkpoint_local_topk = int(ckpt_args.get("local_topk", 0))
+    local_topk = checkpoint_local_topk if local_topk_override is None else int(local_topk_override)
+    if local_topk < 0:
+        raise ValueError(f"local_topk must be non-negative, got {local_topk}")
     reconstructor = SourceGuidedCompactSemanticReconstructor(
         dim=hidden_size,
         num_queries=int(ckpt_args.get("num_queries", 144)),
@@ -359,7 +374,7 @@ def _load_reconstructor(
         dim_head=int(ckpt_args.get("dim_head", 128)),
         ff_mult=int(ckpt_args.get("ff_mult", 2)),
         dropout=float(ckpt_args.get("dropout", 0.0)),
-        local_topk=int(ckpt_args.get("local_topk", 0)),
+        local_topk=local_topk,
         local_radius=float(ckpt_args.get("local_radius", 0.0)),
     ).to(device=device, dtype=dtype)
     reconstructor.load_state_dict(payload["reconstructor"], strict=True)
@@ -612,8 +627,15 @@ def main() -> int:
         hidden_size=hidden_size,
         device=device,
         dtype=reconstructor_dtype,
+        local_topk_override=args.local_topk,
     )
-    print(f"[INFO] loaded SGCSR checkpoint: {args.checkpoint_path}", flush=True)
+    effective_local_topk = int(reconstructor.layers[0].local_topk)
+    effective_local_radius = float(reconstructor.layers[0].local_radius)
+    print(
+        f"[INFO] loaded SGCSR checkpoint: {args.checkpoint_path} "
+        f"local_topk={effective_local_topk} local_radius={effective_local_radius}",
+        flush=True,
+    )
 
     dataset = SGCSRCompressedDataset(
         data_path=args.data_path,
@@ -809,6 +831,11 @@ def main() -> int:
         "test_ratio": args.test_ratio,
         "seed": args.seed,
         "split_summary": split_summary,
+        "local_attention": {
+            "local_topk": effective_local_topk,
+            "local_radius": effective_local_radius,
+            "local_topk_override": args.local_topk,
+        },
         "metrics_note": {
             "cider": "single-reference CIDEr-style TF-IDF 1-4 gram score over the generated subset",
             "cloud_latency_ms": "projector + optional SGCSR + LLM teacher-forced forward; edge vision time is excluded",

@@ -447,7 +447,7 @@ def compact_feature_distillation_loss(
     mse_weight: float = 1.0,
     cosine_weight: float = 0.1,
 ) -> torch.Tensor:
-    """Feature distillation loss for compact semantic reconstruction."""
+    """Align compact student and teacher tokens in normalized feature space."""
     if student_tokens.shape != teacher_compact_tokens.shape:
         raise ValueError(
             "student_tokens and teacher_compact_tokens must have the same shape; "
@@ -455,10 +455,10 @@ def compact_feature_distillation_loss(
         )
 
     teacher_compact_tokens = teacher_compact_tokens.detach()
-    # Compute the reconstruction objective in fp32 even when the model runs in
-    # fp16/bf16. This avoids tiny feature differences being rounded away inside
-    # the distillation loss, while still allowing the module itself to use the
-    # dtype chosen by the training script.
-    mse = F.mse_loss(student_tokens.float(), teacher_compact_tokens.float())
-    cosine = 1.0 - F.cosine_similarity(student_tokens.float(), teacher_compact_tokens.float(), dim=-1).mean()
-    return mse_weight * mse + cosine_weight * cosine
+    # Keep the legacy weights in the signature so existing training commands
+    # and checkpoints remain compatible with this alignment ablation.
+    _ = mse_weight, cosine_weight
+
+    student_tokens_norm = F.normalize(student_tokens.float(), dim=-1)
+    teacher_tokens_norm = F.normalize(teacher_compact_tokens.float(), dim=-1)
+    return F.mse_loss(student_tokens_norm, teacher_tokens_norm)
